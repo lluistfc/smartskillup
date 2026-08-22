@@ -14,7 +14,7 @@ local ENTITY_STATUS_ENGAGED = 1;
 
 local defaults = T{
     visible = T{ true },
-    mode = T{ 1 }, -- 1 = spell rotation, 2 = command rotation, 3 = Ambuscade
+    mode = T{ 1 }, -- 1 = skill-up, 2 = commands, 3 = Ambuscade, 4 = AFK
     delay = T{ 4.0 },
     mp_limit = T{ 0 },
     rest_below = T{ 15 },
@@ -23,6 +23,7 @@ local defaults = T{
     commands = T{},
     actions = T{ rotation = T{} },
     ambuscade = T{
+        profile = T{ 'plantoids_2026_08' },
         weapon_skill_tp = T{ 1000 },
         song_duration = T{ 150 },
         song_refresh_margin = T{ 15 },
@@ -175,16 +176,6 @@ local function role_actions(role, effect)
     return result;
 end
 
-local function rotation_actions()
-    local result = {};
-    for _, category in ipairs({ 'spells', 'job_abilities', 'weapon_skills' }) do
-        for _, action in ipairs(selected_actions(state.settings.actions.rotation, category)) do
-            table.insert(result, action);
-        end
-    end
-    return result;
-end
-
 local function enabled_commands()
     local result = {};
     for _, entry in ipairs(state.settings.commands) do
@@ -193,11 +184,6 @@ local function enabled_commands()
         end
     end
     return result;
-end
-
-local function current_mp_percent(player)
-    local party = AshitaCore:GetMemoryManager():GetParty();
-    return party:GetMemberMPPercent(0) or 0;
 end
 
 local function is_spell_ready(spell)
@@ -243,7 +229,9 @@ local function target_for(spell)
     return '<t>';
 end
 
+local active_mode;
 local function stop(reason)
+    if (state.active and active_mode and active_mode.stop) then active_mode.stop(); end
     if (state.resting) then queue('/heal'); end
     state.active = false;
     state.paused = false;
@@ -253,6 +241,8 @@ local function stop(reason)
 end
 
 local ambuscade;
+local skillup;
+local afk;
 local function start()
     if (state.settings.mode[1] == 3) then
         local player = AshitaCore:GetMemoryManager():GetPlayer();
@@ -261,26 +251,32 @@ local function start()
             return;
         end
         rebuild_action_catalog();
-        ambuscade.reset();
+        ambuscade.activate(); ambuscade.reset(); active_mode = ambuscade;
     elseif (state.settings.mode[1] == 2) then
+        active_mode = nil;
         if (#enabled_commands() == 0) then
             log('error', 'Add and enable at least one command first.');
             return;
         end
+    elseif (state.settings.mode[1] == 4) then
+        active_mode = afk;
+        local ok, message = afk.start();
+        if (not ok) then log('error', message); return; end
     else
-        rebuild_action_catalog();
-        if (#rotation_actions() == 0) then
-            log('error', 'Select at least one currently available action first.'); return;
-        end
+        active_mode = skillup;
+        local ok, message = skillup.start();
+        if (not ok) then log('error', message); return; end
     end
     state.active = true;
     state.paused = false;
     state.resting = false;
     state.next_action = now();
     state.status = state.settings.mode[1] == 3 and 'Ambuscade: preparing buffs'
-        or (state.settings.mode[1] == 2 and 'Running commands' or 'Running actions');
-    log('ok', state.settings.mode[1] == 3 and 'Plantoid Ambuscade routine started.'
-        or (state.settings.mode[1] == 2 and 'Command session started.' or 'Skill-up session started.'));
+        or (state.settings.mode[1] == 4 and state.status
+        or (state.settings.mode[1] == 2 and 'Running commands' or 'Running actions'));
+    log('ok', state.settings.mode[1] == 3 and (ambuscade.label .. ' routine started.')
+        or (state.settings.mode[1] == 4 and 'AFK retaliation armed.'
+        or (state.settings.mode[1] == 2 and 'Command session started.' or 'Skill-up session started.')));
 end
 
 local function action_ready(action)
@@ -301,7 +297,7 @@ local function action_ready(action)
     return true;
 end
 
-ambuscade = require('ambuscade').new({
+local mode_context = {
     state = state,
     now = now,
     queue = queue,
@@ -314,13 +310,31 @@ ambuscade = require('ambuscade').new({
     timeline_add = timeline_add,
     timeline_prune = timeline_prune,
     ambuscade_queue = ambuscade_queue,
-});
+    selected_actions = selected_actions,
+    refresh_catalog = rebuild_action_catalog,
+    refresh_catalog_if_needed = function(player)
+        if (player and current_job_key(player) ~= state.action_catalog_job) then rebuild_action_catalog(); end
+    end,
+    spell_target = function(id)
+        local spell = AshitaCore:GetResourceManager():GetSpellById(id);
+        return spell and target_for(spell) or '<t>';
+    end,
+    action_command = action_catalog.command,
+    player_engaged = is_player_engaged,
+};
+ambuscade = require('modes.ambuscade').new(mode_context);
+skillup = require('modes.skillup').new(mode_context);
+afk = require('modes.afk').new(mode_context);
 
 local function tick()
-    if (not state.active or state.paused or now() < state.next_action or not player_ready()) then return; end
+    if (not state.active or state.paused or now() < state.next_action) then return; end
+    if (state.settings.mode[1] ~= 4 and not player_ready()) then return; end
 
     if (state.settings.mode[1] == 3) then
         ambuscade.tick();
+        return;
+    elseif (state.settings.mode[1] == 4) then
+        afk.tick();
         return;
     elseif (state.settings.mode[1] == 2) then
         local commands = enabled_commands();
@@ -335,52 +349,7 @@ local function tick()
         return;
     end
 
-    local player = AshitaCore:GetMemoryManager():GetPlayer();
-    if (current_job_key(player) ~= state.action_catalog_job) then rebuild_action_catalog(); end
-
-    local mpp = current_mp_percent(player);
-    if (state.resting) then
-        if (mpp >= state.settings.resume_above[1]) then
-            queue('/heal');
-            state.resting = false;
-            state.status = 'Running';
-            state.next_action = now() + 1.0;
-        else
-            state.status = ('Resting (%d%% MP)'):fmt(mpp);
-            state.next_action = now() + 1.0;
-        end
-        return;
-    elseif (state.settings.rest_below[1] > 0 and mpp <= state.settings.rest_below[1]) then
-        queue('/heal');
-        state.resting = true;
-        state.status = ('Resting (%d%% MP)'):fmt(mpp);
-        state.next_action = now() + 2.0;
-        return;
-    end
-
-    local actions = rotation_actions();
-    if (#actions == 0) then stop('Stopped: no actions selected.'); return; end
-    local mp = AshitaCore:GetMemoryManager():GetParty():GetMemberMP(0) or 0;
-    for offset = 0, #actions - 1 do
-        local index = ((state.skill_cursor + offset - 1) % #actions) + 1;
-        local action = actions[index];
-        local affordable = action.kind ~= 'spell' or ((action.mana or 0) <= mp
-            and (state.settings.mp_limit[1] <= 0 or (action.mana or 0) <= state.settings.mp_limit[1]));
-        if (affordable and action_ready(action)) then
-            local target = '<t>';
-            if (action.kind == 'spell') then
-                target = target_for(AshitaCore:GetResourceManager():GetSpellById(action.id));
-            elseif (bit.band(action.targets or 0, 0x20) == 0) then target = '<me>'; end
-            queue(action_catalog.command(action, target));
-            state.last_spell = action.name;
-            state.status = ('Using %s (%s)'):fmt(action.name, action.category:gsub('_', ' '));
-            state.skill_cursor = (index % #actions) + 1;
-            state.next_action = now() + math.max(action.kind == 'spell' and 2.5 or 1.0, state.settings.delay[1]);
-            return;
-        end
-    end
-    state.status = is_player_engaged() and 'Waiting for MP/recasts' or 'Waiting for MP/recasts/combat';
-    state.next_action = now() + 1.0;
+    skillup.tick();
 end
 
 local function print_help()
@@ -429,10 +398,17 @@ ashita.events.register('text_in', 'smartskillup_ambuscade_buffs', function (e)
     if (state.settings.mode[1] == 3) then ambuscade.on_text(e); end
 end);
 
+ashita.events.register('packet_in', 'smartskillup_afk_packet', function (e)
+    if (state.active and state.settings.mode[1] == 4) then afk.on_packet(e); end
+end);
+
 local config_ui = require 'config_ui';
 local ui_context = {
     state = state,
-    targets = ambuscade.targets,
+    ambuscade_targets = function () return ambuscade.targets; end,
+    ambuscade_label = ambuscade.profile_label,
+    ambuscade_profiles = ambuscade.available_profiles,
+    afk_state = afk.state,
     now = now,
     save = settings.save,
     stop = stop,
@@ -445,17 +421,7 @@ local ui_context = {
     prune_timeline = ambuscade.timeline_prune,
     wake = function () state.next_action = now(); end,
     next_action = ambuscade.next_action,
-    stats = function ()
-        return {
-            tp = ambuscade.player_tp(), shantotto = ambuscade.shantotto_tp(), qultada = ambuscade.qultada_tp(),
-            moves = ambuscade.finishing_moves(), setup_buffs = ambuscade.role_count('setup_buff'),
-            sleep = state.ambuscade_lullaby_pending and 'verifying'
-                or (state.ambuscade_vivian_asleep and 'active' or 'missing'),
-            julika = ambuscade.buff_count('Bozzetto Julika'),
-            vivian = ambuscade.buff_count('Bozzetto Vivian'),
-            jody = ambuscade.buff_count('Bozzetto Jody'),
-        };
-    end,
+    ambuscade_stats = ambuscade.ui_stats,
 };
 
 ashita.events.register('d3d_present', 'smartskillup_present', function ()
@@ -464,6 +430,7 @@ ashita.events.register('d3d_present', 'smartskillup_present', function ()
 end);
 
 ashita.events.register('unload', 'smartskillup_unload', function ()
+    if (state.active and active_mode and active_mode.stop) then active_mode.stop(); end
     if (state.resting) then queue('/heal'); end
     settings.save();
 end);

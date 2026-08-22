@@ -42,7 +42,7 @@ local function checklist(ctx, container, suffix, effect, only_category)
 end
 
 local function mode_selector(ctx, state)
-    local labels = { 'Action Rotation', 'Command Rotation', 'Ambuscade: Plantoids' };
+    local labels = { 'Skill-up Rotation', 'Command Rotation', 'Ambuscade', 'AFK Retaliation' };
     if (imgui.BeginCombo('Mode', labels[state.settings.mode[1]]) ) then
         for mode, label in ipairs(labels) do
             if (imgui.Selectable(label, state.settings.mode[1] == mode)) then
@@ -92,8 +92,16 @@ end
 
 local function ambuscade_panel(ctx, state)
     imgui.TextWrapped('Configure action roles, enter the battlefield, then press Start.');
+    if (imgui.BeginCombo('Fight profile', ctx.ambuscade_label())) then
+        for _, profile in ipairs(ctx.ambuscade_profiles()) do
+            if (imgui.Selectable(profile.label, state.settings.ambuscade.profile[1] == profile.id)) then
+                state.settings.ambuscade.profile[1] = profile.id; ctx.save();
+            end
+        end
+        imgui.EndCombo();
+    end
     imgui.Text('Active mobs (uncheck when defeated)');
-    for _, name in ipairs(ctx.targets) do
+    for _, name in ipairs(ctx.ambuscade_targets()) do
         if (imgui.Checkbox(name, state.ambuscade_mobs[name])) then ctx.timeline(name .. ': updated'); ctx.wake(); end
     end
     imgui.Separator(); imgui.Text('Configured action roles');
@@ -119,14 +127,16 @@ local function ambuscade_panel(ctx, state)
     if (imgui.SliderInt('Shantotto II sync TP', state.settings.ambuscade.shantotto_sync_tp, 750, 1000)) then ctx.save(); end
     if (imgui.SliderFloat('Maximum WS sync wait', state.settings.ambuscade.ws_sync_wait, 0, 10, '%.1f sec')) then ctx.save(); end
     imgui.PopItemWidth();
-    local stats = ctx.stats();
-    imgui.Text(('Player TP: %d  Shantotto II: %s  Qultada: %s'):fmt(stats.tp, stats.shantotto or 'N/A', stats.qultada or 'N/A'));
-    imgui.Text(('Finishing Moves: %d  Setup buffs: %d'):fmt(stats.moves, stats.setup_buffs));
-    imgui.Text('Vivian Sleep: ' .. stats.sleep);
-    imgui.Text(('Known enemy buffs — Julika: %d  Vivian: %d  Jody: %d'):fmt(stats.julika, stats.vivian, stats.jody));
+    for _, line in ipairs(ctx.ambuscade_stats()) do imgui.Text(line); end
     imgui.Separator(); imgui.TextColored({ .4, .8, 1, 1 }, 'Next: ' .. ctx.next_action());
     ctx.prune_timeline(); imgui.Text('Timeline (commands queued)');
     for _, entry in ipairs(state.ambuscade_timeline) do imgui.Text(('%5.1fs ago  %s'):fmt(ctx.now() - entry.time, entry.label)); end
+end
+
+local function afk_panel(ctx)
+    imgui.TextWrapped('Retaliates only after a live hostile actor targets your character with an incoming action.');
+    imgui.Text('Last attacker: ' .. (ctx.afk_state.last_target or 'None'));
+    imgui.TextDisabled('Enables FFXI auto-target while this mode is running.');
 end
 
 function M.render(ctx)
@@ -140,7 +150,8 @@ function M.render(ctx)
         imgui.Separator(); mode_selector(ctx, state);
         if (state.settings.mode[1] == 1) then rotation_panel(ctx, state);
         elseif (state.settings.mode[1] == 2) then command_panel(ctx, state);
-        else ambuscade_panel(ctx, state); end
+        elseif (state.settings.mode[1] == 3) then ambuscade_panel(ctx, state);
+        else afk_panel(ctx); end
         imgui.Separator();
         if (not state.active) then
             if (imgui.Button('Start', { 90, 0 })) then ctx.start(); end
@@ -152,7 +163,7 @@ function M.render(ctx)
             end
         end
         if (state.settings.mode[1] == 1) then imgui.SameLine(); if (imgui.Button('Refresh Actions', { 120, 0 })) then ctx.refresh(); end end
-        if (state.settings.mode[1] ~= 3) then
+        if (state.settings.mode[1] == 1 or state.settings.mode[1] == 2) then
             imgui.PushItemWidth(130);
             local minimum = state.settings.mode[1] == 2 and .1 or 2.5;
             if (imgui.SliderFloat(state.settings.mode[1] == 2 and 'Command interval (sec)' or 'Action delay (sec)',

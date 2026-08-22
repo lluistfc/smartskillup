@@ -21,20 +21,29 @@ effect.
 
 ## Module layout
 
-- `smartskillup.lua` owns settings, mode lifecycle, commands, and Ashita events.
+- `smartskillup.lua` owns settings, shared services, commands, and Ashita events.
 - `action_catalog.lua` discovers available spells, job abilities, and weapon skills.
-- `ambuscade.lua` owns fight targeting, role execution, timers, and combat-log tracking.
-- `config_ui.lua` renders the configuration window and action checklists.
+- `modes/skillup.lua` repeatedly executes checked actions for skill progression.
+- `modes/afk.lua` detects and engages hostile actors that attack the player.
+- `modes/ambuscade.lua` loads the selected fight from `ambuscades/registry.lua`.
+- `ambuscades/plantoids_2026_08.lua` contains the current fight-specific tactics.
+- `config_ui.lua` renders the configuration window and mode panels.
 
-SmartSkillup has three execution modes:
+SmartSkillup has four execution modes:
 
-- **Spell Rotation** discovers and rotates usable spells for the selected skills.
+- **Skill-up Rotation** repeatedly rotates checked available actions.
 - **Command Rotation** executes an ordered list of user-provided commands and
   repeats from the beginning. Each entry can be individually enabled or disabled.
-- **Ambuscade: Plantoids (BRD/DNC)** runs an August 2026 Volume Two combat profile
-  for Bettyboom's BRD/DNC and configured trust party.
+- **Ambuscade** loads the selected registered fight profile. The current profile
+  is August 2026 Volume Two: Plantoids.
+- **AFK Retaliation** enables `/autotarget` and attacks a live hostile actor only
+  after an incoming action identifies that actor as attacking the player.
 
-## Ambuscade: Plantoids (BRD/DNC)
+Additional Ambuscade fights should be implemented as separate files under
+`ambuscades/` and registered in `ambuscades/registry.lua`; the core mode does not
+need fight-specific changes.
+
+## Ambuscade: August 2026 Plantoids
 
 Summon your trusts and enter the battlefield manually, then press **Start**.
 The profile uses the actions checked for each role. At the configured TP
