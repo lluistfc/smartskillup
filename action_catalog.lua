@@ -1,19 +1,51 @@
 local M = {}
 local ACTION_CATEGORIES = { 'spells', 'job_abilities', 'weapon_skills' }
+local TRUST_SPELL_MIN_ID, TRUST_SPELL_MAX_ID = 896, 1019
 local COMMAND_PREFIXES = {
     spell = '/ma',
     ability = '/ja',
     weaponskill = '/ws',
+}
+local SONG_BUFFS = {
+    { 'paeon', 195 }, { 'ballad', 196 }, { 'minne', 197 }, { 'minuet', 198 },
+    { 'madrigal', 199 }, { 'prelude', 200 }, { 'mambo', 201 }, { 'aubade', 202 },
+    { 'pastoral', 203 }, { 'humming', 204 }, { 'fantasia', 205 }, { 'operetta', 206 },
+    { 'capriccio', 207 }, { 'serenade', 208 }, { 'round', 209 }, { 'gavotte', 210 },
+    { 'fugue', 211 }, { 'rhapsody', 212 }, { 'aria', 213 }, { 'march', 214 },
+    { 'etude', 215 }, { 'carol', 216 }, { 'hymnus', 218 }, { 'mazurka', 219 },
+    { 'sirvente', 220 }, { 'dirge', 221 }, { 'scherzo', 222 },
 }
 
 local function text(value)
     if type(value) == 'string' then
         return value
     end
-    if type(value) == 'table' then
-        return value[1] or value[0] or ''
+    if value ~= nil then
+        local ok, result = pcall(function()
+            return value[1] or value[0] or value[2] or value[3] or value[4]
+        end)
+        if ok and type(result) == 'string' then
+            return result
+        end
     end
     return ''
+end
+
+local function enabled(value)
+    return value == true or value == 1
+end
+
+local function song_buff_id(name, targets)
+    if bit.band(targets or 0, 0x20) ~= 0 then
+        return nil
+    end
+    local lower = name:lower()
+    for _, entry in ipairs(SONG_BUFFS) do
+        if lower:find(entry[1], 1, true) then
+            return entry[2]
+        end
+    end
+    return nil
 end
 
 local function usable_spell(player, spell)
@@ -40,30 +72,35 @@ function M.build(player, resources)
         return result
     end
 
-    if player:HasSpellData() then
+    if enabled(player:HasSpellData()) then
         for id = 0, 1023 do
             local spell = resources:GetSpellById(id)
-            if spell and player:HasSpell(id) and usable_spell(player, spell) then
+            local is_trust = id >= TRUST_SPELL_MIN_ID and id <= TRUST_SPELL_MAX_ID
+            if not is_trust and spell and enabled(player:HasSpell(id)) and usable_spell(player, spell) then
+                local name = text(spell.Name)
                 add(result, seen, {
                     key = 'spell:' .. id,
                     id = id,
                     category = 'spells',
                     kind = 'spell',
-                    name = text(spell.Name),
+                    name = name,
                     description = text(spell.Description):lower(),
                     targets = spell.Targets or 0,
                     mana = spell.ManaCost or 0,
+                    cast_time = (spell.CastTime or 0) / 4,
                     skill = spell.Skill,
+                    status_id = song_buff_id(name, spell.Targets),
+                    is_song = spell.Skill == 40,
                     recast_id = spell.Index or id,
                 })
             end
         end
     end
 
-    if player:HasAbilityData() then
+    if enabled(player:HasAbilityData()) then
         for id = 0, 1023 do
             local ok, known = pcall(player.HasAbility, player, id)
-            if ok and known then
+            if ok and enabled(known) then
                 local ability = resources:GetAbilityById(id)
                 if ability then
                     add(result, seen, {
@@ -80,7 +117,7 @@ function M.build(player, resources)
             end
         end
         for id = 1, 255 do
-            if player:HasWeaponSkill(id) then
+            if enabled(player:HasWeaponSkill(id)) then
                 local ability = resources:GetAbilityById(id)
                 if ability then
                     add(result, seen, {

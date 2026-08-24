@@ -37,7 +37,40 @@ SmartSkillup has four execution modes:
 - **Ambuscade** loads the selected registered fight profile. The current profile
   is August 2026 Volume Two: Plantoids.
 - **AFK Retaliation** enables `/autotarget` and attacks a live hostile actor only
-  after an incoming action identifies that actor as attacking the player.
+  after an incoming action identifies that actor as attacking the player. Its
+  panel has a separate persistent action checklist; while engaged, only those
+  selected spells, job abilities, and weapon skills are rotated. Its optional
+  automatic-pull section scans nearby hostile mobs, stores a selected mob name,
+  and approaches the nearest live match for melee while the player is out of
+  combat. When retaliation selects a new attacker, it checks
+  Ashita's camera-lock state and only issues `/lockon` when lock-on is disabled,
+  briefly drives Ashita's internal auto-follow state toward the attacker so the
+  game performs the turn and emits its own movement packets, then stops movement
+  before using `/attack` and retries until melee engagement is confirmed. The
+  selected combat rotation does not begin until melee engagement is confirmed.
+  While the player is not engaged, a detected attacker always replaces an
+  unrelated current target before the engage sequence continues.
+  Optional distant-attacker recovery uses auto-follow while measuring horizontal distance
+  through Ashita's entity position getters. It stops near the configured melee
+  distance or on engagement. A stalled or timed-out approach is stopped and
+  retried up to three times. Movement is also stopped immediately when recovery
+  is disabled, the mode is paused/stopped, the player dies/zones, or the tracked
+  attacker becomes invalid. Direct attackers are remembered briefly, but only a
+  substantially closer recent attacker can preempt a live target; a melee-confirmed
+  target receives extra protection against rapid target thrashing. Targets
+  that exhaust all approach attempts receive a temporary cooldown. Melee confirmation
+  is tied to the selected target's server ID. When the player is no longer engaged and no direct attacker is
+  tracked, the optional party-claim fallback adopts the current or nearest live
+  mob claimed by a player or Trust in the party. It never adopts unclaimed mobs
+  or mobs claimed by another party. Navmesh routing is attempted when a matching
+  zone mesh is installed; direct auto-follow is the fallback.
+  Selected Bard songs are skipped while their player buff is active and are
+  refreshed according to the configurable duration and early-refresh margin.
+  An opt-in combat packet recorder writes incoming and outgoing packet metadata
+  plus complete raw hexadecimal payloads under
+  `config/addons/smartskillup/logs/` for later behavior analysis. The same log
+  records target adoption, measured distance, attack and follow commands,
+  Ashita auto-run state, movement progress, retries, and stop reasons.
 
 Additional Ambuscade fights should be implemented as separate files under
 `ambuscades/` and registered in `ambuscades/registry.lua`; the core mode does not

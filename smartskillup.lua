@@ -21,7 +21,26 @@ local defaults = T{
     resume_above = T{ 85 },
     target_party = T{ -1 },
     commands = T{},
-    actions = T{ rotation = T{} },
+    actions = T{ rotation = T{}, afk = T{} },
+    afk_action_delay = T{ 3.0 },
+    afk_song_duration = T{ 120 },
+    afk_song_refresh_margin = T{ 10 },
+    afk_packet_log = T{ enabled = T{ false } },
+    afk_recovery = T{
+        enabled = T{ false },
+        use_pathfinding = T{ true },
+        use_pull_spell = T{ true },
+        stop_distance = T{ 5.0 },
+        max_time = T{ 8.0 },
+        adopt_party_claims = T{ true },
+        party_claim_range = T{ 30 },
+    },
+    afk_pull = T{
+        enabled = T{ false },
+        mob_name = T{ '' },
+        spell_key = T{ '' },
+        range = T{ 20 },
+    },
     ambuscade = T{
         profile = T{ 'plantoids_2026_08' },
         weapon_skill_tp = T{ 1000 },
@@ -46,6 +65,7 @@ local state = {
     command_cursor = 1,
     action_catalog = { spells = {}, job_abilities = {}, weapon_skills = {}, by_key = {} },
     action_catalog_job = -1,
+    action_catalog_retry_at = 0,
     last_spell = '',
     status = 'Idle',
     ambuscade_phase = 'idle',
@@ -143,12 +163,22 @@ end
 local function rebuild_action_catalog()
     local player = AshitaCore:GetMemoryManager():GetPlayer();
     state.action_catalog = action_catalog.build(player, AshitaCore:GetResourceManager());
-    state.action_catalog_job = player and current_job_key(player) or -1;
+    local has_spells = player ~= nil and (player:HasSpellData() == true or player:HasSpellData() == 1);
+    local has_abilities = player ~= nil and (player:HasAbilityData() == true or player:HasAbilityData() == 1);
+    local action_count = #state.action_catalog.spells
+        + #state.action_catalog.job_abilities
+        + #state.action_catalog.weapon_skills;
+    state.action_catalog_job = (has_spells or has_abilities) and action_count > 0
+        and current_job_key(player) or -1;
+    state.action_catalog_retry_at = now() + 1.0;
 end
 
 local function current_action_catalog()
     local player = AshitaCore:GetMemoryManager():GetPlayer();
-    if (player and state.action_catalog_job ~= current_job_key(player)) then rebuild_action_catalog(); end
+    if (player and state.action_catalog_job ~= current_job_key(player)
+        and now() >= state.action_catalog_retry_at) then
+        rebuild_action_catalog();
+    end
     return state.action_catalog;
 end
 
@@ -243,6 +273,12 @@ end
 local ambuscade;
 local skillup;
 local afk;
+local function set_paused(value)
+    state.paused = value;
+    if (value and state.settings.mode[1] == 4 and afk and afk.pause) then afk.pause(); end
+    state.next_action = now();
+    state.status = value and 'Paused' or 'Running';
+end
 local function start()
     if (state.settings.mode[1] == 3) then
         local player = AshitaCore:GetMemoryManager():GetPlayer();
@@ -373,9 +409,9 @@ ashita.events.register('command', 'smartskillup_command', function (e)
     elseif (command:any('stop', 'off')) then
         stop('Skill-up session stopped.');
     elseif (command == 'pause') then
-        state.paused = true; state.status = 'Paused'; log('notice', 'Session paused.');
+        set_paused(true); log('notice', 'Session paused.');
     elseif (command:any('resume', 'unpause')) then
-        state.paused = false; state.next_action = now(); state.status = 'Running'; log('ok', 'Session resumed.');
+        set_paused(false); log('ok', 'Session resumed.');
     elseif (command == 'show') then
         state.settings.visible[1] = true; settings.save();
     elseif (command == 'hide') then
@@ -402,6 +438,10 @@ ashita.events.register('packet_in', 'smartskillup_afk_packet', function (e)
     if (state.active and state.settings.mode[1] == 4) then afk.on_packet(e); end
 end);
 
+ashita.events.register('packet_out', 'smartskillup_afk_packet_out', function (e)
+    if (state.active and state.settings.mode[1] == 4) then afk.on_packet_out(e); end
+end);
+
 local config_ui = require 'config_ui';
 local ui_context = {
     state = state,
@@ -409,12 +449,26 @@ local ui_context = {
     ambuscade_label = ambuscade.profile_label,
     ambuscade_profiles = ambuscade.available_profiles,
     afk_state = afk.state,
+    afk_scan_nearby = afk.scan_nearby,
+    afk_nearby_mobs = afk.nearby_mobs,
+    afk_pull_spells = afk.pull_spells,
+    afk_packet_log_path = afk.packet_log_path,
+    afk_sync_packet_log = afk.sync_packet_log,
+    afk_navigation_status = afk.navigation_status,
+    afk_test_navigation_path = afk.test_navigation_path,
     now = now,
     save = settings.save,
     stop = stop,
+    pause = set_paused,
     start = start,
     refresh = rebuild_action_catalog,
     catalog = current_action_catalog,
+    catalog_status = function()
+        local player = AshitaCore:GetMemoryManager():GetPlayer();
+        if (player == nil) then return 'Character data unavailable.'; end
+        return ('Spell data: %s; ability data: %s.'):fmt(
+            tostring(player:HasSpellData()), tostring(player:HasAbilityData()));
+    end,
     has_effect = action_catalog.has_effect,
     party_target_label = party_target_label,
     timeline = ambuscade.timeline_add,
@@ -431,6 +485,7 @@ end);
 
 ashita.events.register('unload', 'smartskillup_unload', function ()
     if (state.active and active_mode and active_mode.stop) then active_mode.stop(); end
+    if (afk and afk.shutdown_navigation) then afk.shutdown_navigation(); end
     if (state.resting) then queue('/heal'); end
     settings.save();
 end);

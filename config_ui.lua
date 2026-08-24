@@ -17,7 +17,7 @@ local roles = {
     { key = 'weapon_skill', label = 'Weapon skills', category = 'weapon_skills' },
 };
 
-local function checklist(ctx, container, suffix, effect, only_category)
+local function checklist(ctx, container, suffix, effect, only_category, open_by_default)
     local catalog, shown = ctx.catalog(), 0;
     for _, category in ipairs(categories) do
         if (only_category == nil or only_category == category.key) then
@@ -26,6 +26,9 @@ local function checklist(ctx, container, suffix, effect, only_category)
                 if (effect == nil or ctx.has_effect(action, effect)) then table.insert(eligible, action); end
             end
             shown = shown + #eligible;
+            if (#eligible > 0 and open_by_default) then
+                imgui.SetNextItemOpen(true, ImGuiCond_FirstUseEver);
+            end
             if (#eligible > 0 and imgui.TreeNode(category.label .. '##' .. suffix)) then
                 for _, action in ipairs(eligible) do
                     if (container[action.key] == nil) then container[action.key] = T{ false }; end
@@ -38,7 +41,10 @@ local function checklist(ctx, container, suffix, effect, only_category)
             end
         end
     end
-    if (shown == 0) then imgui.TextDisabled('No currently available matching actions.'); end
+    if (shown == 0) then
+        imgui.TextDisabled('No currently available matching actions.');
+        if (suffix == 'rotation' or suffix == 'afk') then imgui.TextDisabled(ctx.catalog_status()); end
+    end
 end
 
 local function mode_selector(ctx, state)
@@ -133,10 +139,98 @@ local function ambuscade_panel(ctx, state)
     for _, entry in ipairs(state.ambuscade_timeline) do imgui.Text(('%5.1fs ago  %s'):fmt(ctx.now() - entry.time, entry.label)); end
 end
 
-local function afk_panel(ctx)
+local function afk_panel(ctx, state)
     imgui.TextWrapped('Retaliates only after a live hostile actor targets your character with an incoming action.');
     imgui.Text('Last attacker: ' .. (ctx.afk_state.last_target or 'None'));
     imgui.TextDisabled('Enables FFXI auto-target while this mode is running.');
+    imgui.Separator();
+    imgui.TextWrapped('Choose the actions to rotate while engaged with the attacker.');
+    checklist(ctx, state.settings.actions.afk, 'afk', nil, nil, true);
+    if (imgui.Button('Refresh available actions', { 180, 0 })) then ctx.refresh(); end
+    imgui.PushItemWidth(130);
+    if (imgui.SliderFloat('Action interval (sec)', state.settings.afk_action_delay, 1, 30, '%.1f')) then
+        ctx.save();
+    end
+    if (imgui.SliderInt('Song duration (sec)', state.settings.afk_song_duration, 60, 300)) then ctx.save(); end
+    if (imgui.SliderInt('Refresh songs early (sec)', state.settings.afk_song_refresh_margin, 0, 45)) then
+        ctx.save();
+    end
+    if (imgui.BeginCombo('Weaponskill TP', ('%d TP'):fmt(state.settings.ambuscade.weapon_skill_tp[1]))) then
+        for _, value in ipairs({ 1000, 2000, 3000 }) do
+            if (imgui.Selectable(('%d TP'):fmt(value), state.settings.ambuscade.weapon_skill_tp[1] == value)) then
+                state.settings.ambuscade.weapon_skill_tp[1] = value;
+                ctx.save(); ctx.wake();
+            end
+        end
+        imgui.EndCombo();
+    end
+    if (imgui.SliderInt('Shantotto II sync TP', state.settings.ambuscade.shantotto_sync_tp, 750, 1000)) then
+        ctx.save();
+    end
+    if (imgui.SliderFloat('Maximum WS sync wait', state.settings.ambuscade.ws_sync_wait, 0, 10, '%.1f sec')) then
+        ctx.save();
+    end
+    imgui.PopItemWidth();
+    imgui.TextWrapped('Weapon skills use the Ambuscade policy: Qultada acts first, then Shantotto II synchronization, bounded by the maximum wait.');
+    imgui.Separator();
+    imgui.Text('Distant attacker recovery');
+    if (imgui.Checkbox('Approach distant attackers', state.settings.afk_recovery.enabled)) then
+        ctx.save(); ctx.wake();
+    end
+    if (imgui.Checkbox('Use navmesh pathfinding', state.settings.afk_recovery.use_pathfinding)) then
+        ctx.save(); ctx.wake();
+    end
+    if (imgui.Checkbox('Try pull spell before approaching', state.settings.afk_recovery.use_pull_spell)) then
+        ctx.save(); ctx.wake();
+    end
+    imgui.PushItemWidth(130);
+    if (imgui.SliderFloat('Approach stop distance', state.settings.afk_recovery.stop_distance, 2.41, 10, '%.2f yalms')) then
+        ctx.save();
+    end
+    if (imgui.SliderFloat('Maximum approach time', state.settings.afk_recovery.max_time, 3, 20, '%.1f sec')) then
+        ctx.save();
+    end
+    if (imgui.SliderInt('Party-claimed scan range', state.settings.afk_recovery.party_claim_range, 5, 50)) then
+        ctx.save();
+    end
+    imgui.PopItemWidth();
+    if (imgui.Checkbox('Adopt mobs claimed by party or trusts', state.settings.afk_recovery.adopt_party_claims)) then
+        ctx.save(); ctx.wake();
+    end
+    local nav_status = ctx.afk_navigation_status();
+    imgui.TextWrapped(('Navmesh: %s | mode: %s | last query: %s | waypoints: %s'):fmt(
+        nav_status.loaded and 'loaded' or 'not loaded', tostring(nav_status.mode or 'unresolved'),
+        tostring(nav_status.result or 'none'), tostring(nav_status.waypoint_count or 0)));
+    if (imgui.Button('Test path to current target', { 210, 0 })) then
+        local _, message = ctx.afk_test_navigation_path();
+        state.status = 'AFK navigation: ' .. message;
+    end
+    imgui.TextWrapped('Navmesh movement is used when a mesh exists; direct follow is the fallback. Movement stops if distance is not decreasing.');
+    imgui.Separator();
+    imgui.Text('Combat diagnostics');
+    if (imgui.Checkbox('Record all combat packets', state.settings.afk_packet_log.enabled)) then
+        ctx.save(); ctx.afk_sync_packet_log();
+    end
+    imgui.TextWrapped('Records incoming and outgoing packet metadata and full raw hex. Logs can grow quickly.');
+    local packet_path = ctx.afk_packet_log_path();
+    imgui.TextWrapped(packet_path ~= '' and ('Log: ' .. packet_path) or 'Log starts when combat is detected.');
+    imgui.Separator();
+    imgui.Text('Automatic pull while out of combat');
+    if (imgui.Checkbox('Enable automatic pull', state.settings.afk_pull.enabled)) then ctx.save(); ctx.wake(); end
+    if (imgui.Button('Scan nearby mobs', { 150, 0 })) then ctx.afk_scan_nearby(); end
+    local selected_mob = state.settings.afk_pull.mob_name[1];
+    if (imgui.BeginCombo('Mob name', selected_mob ~= '' and selected_mob or 'Select a nearby mob')) then
+        for _, name in ipairs(ctx.afk_nearby_mobs()) do
+            if (imgui.Selectable(name, selected_mob == name)) then
+                state.settings.afk_pull.mob_name[1] = name; ctx.save(); ctx.wake();
+            end
+        end
+        imgui.EndCombo();
+    end
+    imgui.TextWrapped('Pull search cycles through the scanned names: the selected primary gets three tries, the second name gets two, and every remaining name gets one before returning to the primary.');
+    imgui.PushItemWidth(130);
+    if (imgui.SliderInt('Scan range (yalms)', state.settings.afk_pull.range, 5, 50)) then ctx.save(); end
+    imgui.PopItemWidth();
 end
 
 function M.render(ctx)
@@ -151,7 +245,7 @@ function M.render(ctx)
         if (state.settings.mode[1] == 1) then rotation_panel(ctx, state);
         elseif (state.settings.mode[1] == 2) then command_panel(ctx, state);
         elseif (state.settings.mode[1] == 3) then ambuscade_panel(ctx, state);
-        else afk_panel(ctx); end
+        else afk_panel(ctx, state); end
         imgui.Separator();
         if (not state.active) then
             if (imgui.Button('Start', { 90, 0 })) then ctx.start(); end
@@ -159,7 +253,7 @@ function M.render(ctx)
             if (imgui.Button('Stop', { 90, 0 })) then ctx.stop('Skill-up session stopped.'); end
             imgui.SameLine();
             if (imgui.Button(state.paused and 'Resume' or 'Pause', { 90, 0 })) then
-                state.paused = not state.paused; state.status = state.paused and 'Paused' or 'Running'; ctx.wake();
+                ctx.pause(not state.paused);
             end
         end
         if (state.settings.mode[1] == 1) then imgui.SameLine(); if (imgui.Button('Refresh Actions', { 120, 0 })) then ctx.refresh(); end end
