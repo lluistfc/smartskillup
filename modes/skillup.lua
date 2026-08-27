@@ -63,7 +63,7 @@ function M.new(ctx)
                 state.last_spell = action.name
                 state.status = ('Using %s (%s)'):fmt(action.name, action.category:gsub('_', ' '))
                 state.skill_cursor = (index % #selected) + 1
-                state.next_action = ctx.now() + math.max(action.kind == 'spell' and 2.5 or 1, state.settings.delay[1])
+                ctx.schedule_action(action, state.settings.delay[1])
                 return
             end
         end

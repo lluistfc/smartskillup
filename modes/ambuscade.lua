@@ -15,9 +15,9 @@ function M.new(ctx)
         controller.id, controller.label, controller.targets = metadata.id, metadata.label, current.targets;
     end
     controller.activate();
-    for _, method in ipairs({ 'reset', 'tick', 'next_action', 'on_text', 'timeline_prune',
+    for _, method in ipairs({ 'reset', 'stop', 'pause', 'urgent_tick', 'tick', 'next_action', 'on_text', 'on_packet_out', 'timeline_prune',
         'timeline_add', 'player_tp', 'shantotto_tp', 'qultada_tp', 'finishing_moves',
-        'role_count', 'buff_count', 'ui_stats' }) do
+        'role_count', 'buff_count', 'ui_stats', 'validate' }) do
         local name = method;
         controller[name] = function(...) return current[name](...); end
     end

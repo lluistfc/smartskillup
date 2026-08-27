@@ -1,7 +1,8 @@
 local M = {}
-local ffi = require 'ffi'
 local nav = require 'nav_runtime'
 local nav_logic = require 'nav_logic'
+local combat_rotation = require 'combat_rotation'
+local packet_decoder = require 'packet_decoder'
 local HOSTILE_FLAG, MEMORY_SECONDS, RETRY_SECONDS = 0x10, 10, 3
 local ENGAGE_GRACE_SECONDS, RECOVERY_CAST_WAIT, STUCK_SECONDS = 1.5, 3.0, 2.0
 local SPELL_READY_GRACE, APPROACH_RETRY_SECONDS, MAX_APPROACH_ATTEMPTS = 3.0, 2.0, 3
@@ -15,9 +16,9 @@ local ATTACKER_MEMORY_SECONDS, TARGET_SWITCH_COOLDOWN = 8.0, 1.5
 local TARGET_SWITCH_MARGIN, FAILED_TARGET_COOLDOWN = 1.0, 12.0
 local CONFIRMED_TARGET_SWITCH_MARGIN, ACTIVE_THREAT_SECONDS = 2.0, 4.0
 local NAV_REPLAN_DISTANCE, NAV_REPLAN_SECONDS = 4.0, 3.0
+local NAV_DETOUR_DISTANCE, MAX_NAV_DETOURS = 3.0, 2
 local PULL_SEARCH_RETRY_SECONDS = 1.0
 local ZONE_PACKET, LOGOUT_PACKET, ACTION_PACKET = 0x000A, 0x000B, 0x0028
-local ACTION_CATEGORIES = { 'spells', 'job_abilities', 'weapon_skills' }
 
 function M.new(ctx)
     local state = ctx.state
@@ -31,10 +32,10 @@ function M.new(ctx)
         following = false,
     }
     local afk = state.afk
+    local combat = combat_rotation.new(ctx)
     afk.lockon_issued = afk.lockon_issued or false
     afk.attack_issued = afk.attack_issued or false
     afk.nearby_mobs = afk.nearby_mobs or {}
-    afk.song_cast_at = afk.song_cast_at or {}
     afk.attackers = afk.attackers or {}
     afk.failed_targets = afk.failed_targets or {}
     afk.packet_log_path = afk.packet_log_path or ''
@@ -73,30 +74,6 @@ function M.new(ctx)
         end
         return packet_log_file
     end
-    local function raw_hex(data, size)
-        local output = {}
-        if type(data) == 'string' then
-            local length = #data
-            if type(size) == 'number' and size >= 0 then
-                length = math.min(length, size)
-            end
-            for index = 1, length do
-                output[index] = ('%02X'):fmt(data:byte(index))
-            end
-            return table.concat(output, ' ')
-        end
-        if data == nil or type(size) ~= 'number' or size <= 0 then
-            return ''
-        end
-        local ok, result = pcall(function()
-            local pointer = ffi.cast('const uint8_t*', data)
-            for index = 0, size - 1 do
-                output[index + 1] = ('%02X'):fmt(pointer[index])
-            end
-            return table.concat(output, ' ')
-        end)
-        return ok and result or ''
-    end
     local function fighting()
         return ctx.player_engaged() or (afk.aggressor_index or 0) > 0
     end
@@ -104,15 +81,20 @@ function M.new(ctx)
         if not state.settings.afk_packet_log.enabled[1] or (not force and not fighting()) then
             return false
         end
+        -- Position/entity update packets arrive many times per second and the
+        -- AFK state events already summarize the useful result. Keep only
+        -- action and session-boundary packets in the human-readable log.
+        if e.id ~= ACTION_PACKET and e.id ~= 0x001A
+            and e.id ~= ZONE_PACKET and e.id ~= LOGOUT_PACKET then
+            return false
+        end
         local file = open_packet_log()
         if not file then
             return false
         end
-        local data = type(e.data) == 'string' and e.data or e.data_raw
-        file:write(('[%s] direction=%s id=0x%04X size=%s blocked=%s injected=%s modified=%s\n'):fmt(
-            os.date('%Y-%m-%d %H:%M:%S'), direction, e.id or 0, tostring(e.size or #data),
+        file:write(('[%s] direction=%s %s blocked=%s injected=%s modified=%s\n'):fmt(
+            os.date('%Y-%m-%d %H:%M:%S'), direction, packet_decoder.describe(direction, e),
             tostring(e.blocked), tostring(e.injected), tostring(e.modified)))
-        file:write(raw_hex(data, e.size), '\n')
         file:flush()
         return true
     end
@@ -248,6 +230,7 @@ function M.new(ctx)
         afk.last_waypoint_distance = nil
         afk.waypoint_progress_at = 0
         afk.next_nav_replan_at = 0
+        afk.nav_detour_attempts = 0
         afk.next_lockoff_at = 0
         afk.melee_grace_until = 0
         afk.ws_wait_started = 0
@@ -257,71 +240,6 @@ function M.new(ctx)
         afk.failure_recorded = false
         afk.invalid_since = 0
         afk.stale_clear_issued = false
-    end
-    local function actions()
-        local result = {}
-        for _, category in ipairs(ACTION_CATEGORIES) do
-            for _, action in ipairs(ctx.selected_actions(state.settings.actions.afk, category)) do
-                table.insert(result, action)
-            end
-        end
-        return result
-    end
-    local function trust_tp(expected_name)
-        local party = AshitaCore:GetMemoryManager():GetParty()
-        if not party then return nil end
-        for index = 1, 5 do
-            if party:GetMemberIsActive(index) == 1 then
-                local name = party:GetMemberName(index) or ''
-                if name:lower() == expected_name:lower() then
-                    return party:GetMemberTP(index) or 0
-                end
-            end
-        end
-        return nil
-    end
-    local function trusts_ready_for_weapon_skill()
-        local shantotto = trust_tp('Shantotto II')
-        local qultada = trust_tp('Qultada')
-        return (shantotto == nil or shantotto >= state.settings.ambuscade.shantotto_sync_tp[1])
-            and (qultada == nil or qultada < 1000)
-    end
-    local function selected_weapon_skill()
-        for _, action in ipairs(ctx.selected_actions(state.settings.actions.afk, 'weapon_skills')) do
-            if ctx.action_ready(action) then return action end
-        end
-        return nil
-    end
-    local function has_player_buff(buff_id)
-        if type(buff_id) ~= 'number' or buff_id <= 0 then
-            return false
-        end
-        local player = AshitaCore:GetMemoryManager():GetPlayer()
-        local buffs = player and player:GetBuffs() or {}
-        for _, active_buff in pairs(buffs) do
-            if active_buff == buff_id then
-                return true
-            end
-        end
-        return false
-    end
-    local function song_due(action, current)
-        if not action.is_song then
-            return true
-        end
-        local active = has_player_buff(action.status_id)
-        local cast_at = afk.song_cast_at[action.key]
-        if not active then
-            return true
-        end
-        if cast_at == nil then
-            return false
-        end
-        local interval = math.max(
-            30,
-            state.settings.afk_song_duration[1] - state.settings.afk_song_refresh_margin[1]
-        )
-        return current >= cast_at + interval
     end
     local function hostile(index)
         if not index or index <= 0 or type(GetEntity) ~= 'function' then
@@ -558,6 +476,8 @@ function M.new(ctx)
                 end_position.x, end_position.y, end_position.z, tostring(path_error), nav_details(diagnostics)))
             return false
         end
+        path = nav_logic.stop_short(path, start_position, end_position,
+            state.settings.afk_recovery.stop_distance[1])
         afk.nav_path = path
         afk.nav_cursor = 1
         afk.nav_target_position = end_position
@@ -638,6 +558,28 @@ function M.new(ctx)
         afk.following = true
         afk.follow_reason = 'nav_approach'
         return true
+    end
+    local function insert_lateral_detour(waypoint)
+        local position = entity_position(player_index())
+        if not position or not waypoint or not afk.nav_path
+            or afk.nav_detour_attempts >= MAX_NAV_DETOURS then return nil end
+        local attempt = afk.nav_detour_attempts + 1
+        local side = attempt % 2 == 1 and 1 or -1
+        local detour = nav_logic.lateral_detour(position, waypoint, NAV_DETOUR_DISTANCE, side)
+        afk.nav_detour_attempts = attempt
+        if not detour or nav.can_see(position, detour) == false then
+            trace_event('nav_detour_rejected', ('attempt=%d side=%s reason=not_visible'):fmt(
+                attempt, side > 0 and 'left' or 'right'))
+            return nil
+        end
+        table.insert(afk.nav_path, afk.nav_cursor, detour)
+        afk.nav_waypoint_cursor = 0
+        afk.last_waypoint_distance = nil
+        afk.waypoint_progress_at = ctx.now()
+        trace_event('nav_detour_inserted', ('attempt=%d side=%s cursor=%d point=%.3f,%.3f,%.3f blocked_waypoint=%.3f,%.3f,%.3f'):fmt(
+            attempt, side > 0 and 'left' or 'right', afk.nav_cursor,
+            detour.x, detour.y, detour.z, waypoint.x, waypoint.y, waypoint.z))
+        return detour
     end
     local function nearest_party_claimed_target()
         local manager = AshitaCore:GetMemoryManager()
@@ -822,15 +764,20 @@ function M.new(ctx)
     end
     local function start()
         ctx.refresh_catalog()
-        if #actions() == 0 then
-            return false, 'Select at least one AFK action first.'
+        local role_count = #combat.setup_actions()
+        for _, role in ipairs({ 'heal', 'combat_buff',
+            'combat_debuff', 'tp_recovery', 'weapon_skill' }) do
+            role_count = role_count + #ctx.role_actions(role)
+        end
+        if role_count == 0 then
+            return false, 'Select at least one shared combat-role action first.'
         end
         reset()
+        combat.reset()
         afk.attackers = {}
         afk.failed_targets = {}
         afk.next_target_switch_at = 0
         scan_nearby()
-        state.afk_action_cursor = 1
         ctx.queue '/autotarget on'
         state.status = 'AFK: waiting for an attacker'
         return true, 'AFK retaliation armed; auto-target is on.'
@@ -853,6 +800,15 @@ function M.new(ctx)
             state.status = 'AFK: waiting for character recovery'
             state.next_action = current + 0.5
             return
+        end
+        if not ctx.player_engaged() then
+            if combat.tick({
+                has_target = false,
+                target_has_enhancements = false,
+                allow_setup = true,
+                status_prefix = 'AFK: ',
+                queue_action = function(_, command) ctx.queue(command) end,
+            }) then return end
         end
         prune_attackers(current)
         local preferred_attacker = best_direct_attacker(current, afk.aggressor_server_id)
@@ -1022,54 +978,22 @@ function M.new(ctx)
         if engaged and not needs_approach then
             stop_following('engagement_confirmed')
             ensure_lockon()
-            local selected = actions()
-            if #selected == 0 then
-                ctx.stop 'Stopped: no AFK actions selected.'
-                return
-            end
-            local party = AshitaCore:GetMemoryManager():GetParty()
-            local mp = party and (party:GetMemberMP(0) or 0) or 0
-            local tp = party and (party:GetMemberTP(0) or 0) or 0
-            local ws = selected_weapon_skill()
-            local ws_threshold = state.settings.ambuscade.weapon_skill_tp[1]
-            if ws and tp >= ws_threshold then
-                if afk.ws_wait_started == 0 then afk.ws_wait_started = current end
-                local waited = current - afk.ws_wait_started
-                local maximum_wait = state.settings.ambuscade.ws_sync_wait[1]
-                if trusts_ready_for_weapon_skill() or waited >= maximum_wait then
-                    ctx.queue(ctx.action_command(ws, '<t>'))
-                    state.last_spell = ws.name
-                    state.status = ('AFK: weaponskill %s (%d TP)'):fmt(ws.name, tp)
-                    afk.ws_wait_started = 0
-                    state.next_action = current + math.max(2.0, state.settings.afk_action_delay[1])
-                    return
-                end
-                state.status = ('AFK: holding WS for trusts (%.1f/%.1fs)'):fmt(waited, maximum_wait)
-                state.next_action = current + 0.25
-                return
-            end
-            afk.ws_wait_started = 0
-            for offset = 0, #selected - 1 do
-                local index = ((state.afk_action_cursor + offset - 1) % #selected) + 1
-                local action = selected[index]
-                local affordable = action.kind ~= 'spell' or (action.mana or 0) <= mp
-                local usable = action.kind ~= 'weaponskill'
-                if affordable and usable and ctx.action_ready(action) and song_due(action, current) then
-                    local target = action.kind == 'spell' and ctx.spell_target(action.id)
-                        or (bit.band(action.targets or 0, 0x20) == 0 and '<me>' or '<t>')
-                    ctx.queue(ctx.action_command(action, target))
-                    state.last_spell = action.name
-                    if action.is_song then afk.song_cast_at[action.key] = current end
-                    state.status = ('AFK: using %s'):fmt(action.name)
-                    state.afk_action_cursor = (index % #selected) + 1
-                    state.next_action = ctx.now() + math.max(
-                        action.kind == 'spell' and 2.5 or 1,
-                        state.settings.afk_action_delay[1]
-                    )
-                    return
-                end
-            end
-            state.status = 'AFK: engaged; waiting for MP/recasts'
+            local entity = GetEntity(afk.aggressor_index)
+            if combat.tick({
+                has_target = true,
+                -- AFK establishes and refreshes its Terpander song slots only
+                -- while idle. The rest of the shared combat rotation remains
+                -- active after engagement.
+                allow_setup = false,
+                target_key = tostring(afk.aggressor_server_id or afk.aggressor_index),
+                target_name = entity and entity.Name or 'target',
+                -- AFK has no battle-message enhancement tracker, so automatic
+                -- dispel remains dormant outside fight profiles that provide it.
+                target_has_enhancements = false,
+                status_prefix = 'AFK: ',
+                queue_action = function(_, command) ctx.queue(command) end,
+            }) then return end
+            state.status = 'AFK: engaged; shared combat rotation waiting'
             state.next_action = ctx.now() + 1
             return
         end
@@ -1204,7 +1128,14 @@ function M.new(ctx)
                         trace_event('nav_replan_requested', ('reason=waypoint_stalled cursor=%d waypoint_distance=%s target_distance=%.2f'):fmt(
                             afk.nav_cursor, tostring(waypoint_distance_now), distance))
                         afk.next_nav_replan_at = current + NAV_REPLAN_SECONDS
-                        if plan_nav_path(afk.aggressor_index) then
+                        local detour = insert_lateral_detour(waypoint)
+                        if detour then
+                            waypoint = detour
+                            steer_to_waypoint(waypoint)
+                            afk.last_waypoint_distance = waypoint_distance(waypoint)
+                            afk.waypoint_progress_at = current
+                            stuck = false
+                        elseif plan_nav_path(afk.aggressor_index) then
                             waypoint = current_nav_waypoint()
                             if waypoint then
                                 steer_to_waypoint(waypoint)

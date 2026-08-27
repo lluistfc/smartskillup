@@ -119,6 +119,9 @@ local function ambuscade_panel(ctx, state)
     end
     if (imgui.Button('Refresh available actions', { 180, 0 })) then ctx.refresh(); end
     imgui.PushItemWidth(180);
+    if (imgui.Checkbox('Use Terpander three-song rotation', state.settings.ambuscade.terpander_three_song)) then
+        state.ambuscade_phase = 'setup'; state.ambuscade_cursor = 1; ctx.save(); ctx.wake();
+    end
     if (imgui.BeginCombo('Weaponskill TP', ('%d TP'):fmt(state.settings.ambuscade.weapon_skill_tp[1]))) then
         for _, value in ipairs({ 1000, 2000, 3000 }) do
             if (imgui.Selectable(('%d TP'):fmt(value), state.settings.ambuscade.weapon_skill_tp[1] == value)) then
@@ -130,6 +133,13 @@ local function ambuscade_panel(ctx, state)
     if (imgui.SliderInt('Recurring buff duration (sec)', state.settings.ambuscade.song_duration, 60, 300)) then ctx.save(); end
     if (imgui.SliderInt('Refresh buffs early (sec)', state.settings.ambuscade.song_refresh_margin, 5, 45)) then ctx.save(); end
     if (imgui.SliderInt('Heal below HP%', state.settings.ambuscade.heal_below, 20, 80)) then ctx.save(); end
+    if (imgui.SliderInt('Combat debuff duration (sec)', state.settings.ambuscade.combat_debuff_duration,
+        15, 180)) then ctx.save(); end
+    if (imgui.Checkbox('Approach selected targets', state.settings.ambuscade.approach_targets)) then
+        ctx.save(); ctx.wake();
+    end
+    if (imgui.SliderFloat('Approach stop distance', state.settings.ambuscade.approach_stop_distance,
+        2.41, 10, '%.2f yalms')) then ctx.save(); end
     if (imgui.SliderInt('Shantotto II sync TP', state.settings.ambuscade.shantotto_sync_tp, 750, 1000)) then ctx.save(); end
     if (imgui.SliderFloat('Maximum WS sync wait', state.settings.ambuscade.ws_sync_wait, 0, 10, '%.1f sec')) then ctx.save(); end
     imgui.PopItemWidth();
@@ -144,17 +154,26 @@ local function afk_panel(ctx, state)
     imgui.Text('Last attacker: ' .. (ctx.afk_state.last_target or 'None'));
     imgui.TextDisabled('Enables FFXI auto-target while this mode is running.');
     imgui.Separator();
-    imgui.TextWrapped('Choose the actions to rotate while engaged with the attacker.');
-    checklist(ctx, state.settings.actions.afk, 'afk', nil, nil, true);
+    imgui.TextWrapped('Uses the same role-based combat rotation as Ambuscade; movement and target acquisition remain AFK-specific.');
+    for _, role in ipairs(roles) do
+        if (role.key ~= 'sleep' and role.key ~= 'dispel') then
+            if (imgui.TreeNode(role.label .. '##afk_role_' .. role.key)) then
+                checklist(ctx, state.settings.ambuscade.roles[role.key], 'afk_role_' .. role.key,
+                    role.effect, role.category);
+                imgui.TreePop();
+            end
+        end
+    end
     if (imgui.Button('Refresh available actions', { 180, 0 })) then ctx.refresh(); end
     imgui.PushItemWidth(130);
-    if (imgui.SliderFloat('Action interval (sec)', state.settings.afk_action_delay, 1, 30, '%.1f')) then
-        ctx.save();
+    if (imgui.Checkbox('Use Terpander three-song rotation', state.settings.ambuscade.terpander_three_song)) then
+        state.ambuscade_phase = 'setup'; state.ambuscade_cursor = 1; ctx.save(); ctx.wake();
     end
-    if (imgui.SliderInt('Song duration (sec)', state.settings.afk_song_duration, 60, 300)) then ctx.save(); end
-    if (imgui.SliderInt('Refresh songs early (sec)', state.settings.afk_song_refresh_margin, 0, 45)) then
-        ctx.save();
-    end
+    if (imgui.SliderInt('Recurring buff duration (sec)', state.settings.ambuscade.song_duration, 60, 300)) then ctx.save(); end
+    if (imgui.SliderInt('Refresh buffs early (sec)', state.settings.ambuscade.song_refresh_margin, 5, 45)) then ctx.save(); end
+    if (imgui.SliderInt('Heal below HP%', state.settings.ambuscade.heal_below, 20, 80)) then ctx.save(); end
+    if (imgui.SliderInt('Combat debuff duration (sec)', state.settings.ambuscade.combat_debuff_duration,
+        15, 180)) then ctx.save(); end
     if (imgui.BeginCombo('Weaponskill TP', ('%d TP'):fmt(state.settings.ambuscade.weapon_skill_tp[1]))) then
         for _, value in ipairs({ 1000, 2000, 3000 }) do
             if (imgui.Selectable(('%d TP'):fmt(value), state.settings.ambuscade.weapon_skill_tp[1] == value)) then
@@ -241,11 +260,22 @@ function M.render(ctx)
         bit.bor(ImGuiWindowFlags_AlwaysAutoResize, ImGuiWindowFlags_NoCollapse))) then
         imgui.TextColored(state.active and { .3, 1, .4, 1 } or { .8, .8, .8, 1 }, state.status);
         if (state.last_spell ~= '') then imgui.Text('Last: ' .. state.last_spell); end
+        if (state.pending_action ~= nil) then
+            imgui.TextDisabled(('Action in flight: %s'):fmt(state.pending_action.name or state.pending_action.key));
+        elseif (state.last_action_outcome ~= nil) then
+            imgui.TextDisabled(('Action result: %s (%s)'):fmt(
+                state.last_action_outcome.name or state.last_action_outcome.key,
+                state.last_action_outcome.status));
+        end
         imgui.Separator(); mode_selector(ctx, state);
         if (state.settings.mode[1] == 1) then rotation_panel(ctx, state);
         elseif (state.settings.mode[1] == 2) then command_panel(ctx, state);
         elseif (state.settings.mode[1] == 3) then ambuscade_panel(ctx, state);
-        else afk_panel(ctx, state); end
+        else
+            imgui.BeginChild('##afk_settings', { 0, 460 }, ImGuiChildFlags_Borders);
+            afk_panel(ctx, state);
+            imgui.EndChild();
+        end
         imgui.Separator();
         if (not state.active) then
             if (imgui.Button('Start', { 90, 0 })) then ctx.start(); end

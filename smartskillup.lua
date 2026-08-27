@@ -10,6 +10,8 @@ local chat     = require 'chat';
 local imgui    = require 'imgui';
 local settings = require 'settings';
 local action_catalog = require 'action_catalog';
+local action_timing = require 'action_timing';
+local combat_trace = require 'combat_trace';
 local ENTITY_STATUS_ENGAGED = 1;
 
 local defaults = T{
@@ -21,10 +23,7 @@ local defaults = T{
     resume_above = T{ 85 },
     target_party = T{ -1 },
     commands = T{},
-    actions = T{ rotation = T{}, afk = T{} },
-    afk_action_delay = T{ 3.0 },
-    afk_song_duration = T{ 120 },
-    afk_song_refresh_margin = T{ 10 },
+    actions = T{ rotation = T{} },
     afk_packet_log = T{ enabled = T{ false } },
     afk_recovery = T{
         enabled = T{ false },
@@ -46,7 +45,11 @@ local defaults = T{
         weapon_skill_tp = T{ 1000 },
         song_duration = T{ 150 },
         song_refresh_margin = T{ 15 },
+        terpander_three_song = T{ true },
+        approach_targets = T{ true },
+        approach_stop_distance = T{ 5.0 },
         heal_below = T{ 55 },
+        combat_debuff_duration = T{ 60 },
         shantotto_sync_tp = T{ 900 },
         ws_sync_wait = T{ 4.0 },
         roles = T{
@@ -70,6 +73,7 @@ local state = {
     status = 'Idle',
     ambuscade_phase = 'idle',
     ambuscade_cursor = 1,
+    ambuscade_opening_ability_cursor = 1,
     ambuscade_setup_verified = 0,
     ambuscade_song_attempts = 0,
     ambuscade_samba_at = 0,
@@ -84,6 +88,8 @@ local state = {
     ambuscade_reverse_at = 0,
     ambuscade_waltz_at = 0,
     ambuscade_engaged = false,
+    ambuscade_bonus_engage_at = 0,
+    ambuscade_bonus_engage_attempts = 0,
     ambuscade_timeline = {},
     ambuscade_mobs = {
         ['Bozzetto Julika'] = T{ true },
@@ -95,6 +101,9 @@ local state = {
         ['Bozzetto Vivian'] = {},
         ['Bozzetto Jody'] = {},
     },
+    ambuscade_last_command_at = 0,
+    ambuscade_last_heartbeat_at = 0,
+    ambuscade_last_watchdog_at = 0,
 };
 if (state.settings.ambuscade.weapon_skill_tp[1] ~= 1000
     and state.settings.ambuscade.weapon_skill_tp[1] ~= 2000
@@ -135,6 +144,26 @@ local function timeline_add(label)
     while (#state.ambuscade_timeline > 5) do table.remove(state.ambuscade_timeline); end
 end
 
+local function target_trace_details(extra)
+    local target = AshitaCore:GetMemoryManager():GetTarget();
+    local entities = AshitaCore:GetMemoryManager():GetEntity();
+    local index = target and (target:GetTargetIndex(0) or 0) or 0;
+    local entity = index > 0 and type(GetEntity) == 'function' and GetEntity(index) or nil;
+    local name = entity and (entity.Name or entity.name or '') or '';
+    local server_id = index > 0 and (entities:GetServerId(index) or 0) or 0;
+    local player_entity = type(GetPlayerEntity) == 'function' and GetPlayerEntity() or nil;
+    local engaged = player_entity ~= nil and player_entity.Status == ENTITY_STATUS_ENGAGED;
+    local party = AshitaCore:GetMemoryManager():GetParty();
+    local tp = party and (party:GetMemberTP(0) or 0) or 0;
+    return ('target_index=%d target_server_id=%s target_name=%q engaged=%s tp=%d pending=%s%s'):fmt(
+        index, tostring(server_id), name, tostring(engaged), tp,
+        tostring(state.pending_action and state.pending_action.token or 'none'), extra and (' ' .. extra) or '');
+end
+
+local function trace_event(label, details)
+    combat_trace.event(now(), label, target_trace_details(details));
+end
+
 local function timeline_prune()
     local current_time = now();
     for index = #state.ambuscade_timeline, 1, -1 do
@@ -145,6 +174,8 @@ local function timeline_prune()
 end
 
 local function ambuscade_queue(label, command)
+    state.ambuscade_last_command_at = now();
+    trace_event('command_queue', ('label=%q command=%q'):fmt(label, command));
     queue(command);
     timeline_add('Queued: ' .. label);
 end
@@ -266,7 +297,13 @@ local function stop(reason)
     state.active = false;
     state.paused = false;
     state.resting = false;
+    state.pending_action = nil;
+    state.last_action_outcome = nil;
+    state.action_outcomes = {};
+    state.action_outcome_order = {};
     state.status = reason or 'Stopped';
+    if (state.settings.mode[1] == 3) then trace_event('session_stop', ('reason=%q'):fmt(state.status)); end
+    combat_trace.close();
     log('notice', state.status);
 end
 
@@ -275,9 +312,12 @@ local skillup;
 local afk;
 local function set_paused(value)
     state.paused = value;
-    if (value and state.settings.mode[1] == 4 and afk and afk.pause) then afk.pause(); end
+    if (value and active_mode and active_mode.pause) then active_mode.pause(); end
     state.next_action = now();
     state.status = value and 'Paused' or 'Running';
+    if (state.active and state.settings.mode[1] == 3) then
+        trace_event('pause_changed', ('paused=%s source=user_command_or_panel'):fmt(tostring(value)));
+    end
 end
 local function start()
     if (state.settings.mode[1] == 3) then
@@ -287,7 +327,27 @@ local function start()
             return;
         end
         rebuild_action_catalog();
+        local roles = state.settings.ambuscade.roles;
+        local metadata = ('profile=%s ws_tp=%s song_duration=%s refresh_margin=%s terpander=%s roles_setup=%d roles_sleep=%d roles_ws=%d'):fmt(
+            tostring(state.settings.ambuscade.profile[1]), tostring(state.settings.ambuscade.weapon_skill_tp[1]),
+            tostring(state.settings.ambuscade.song_duration[1]), tostring(state.settings.ambuscade.song_refresh_margin[1]),
+            tostring(state.settings.ambuscade.terpander_three_song[1]),
+            #role_actions('setup_buff'), #role_actions('sleep'), #role_actions('weapon_skill'));
+        local trace_path = combat_trace.open(metadata);
+        if (trace_path ~= '') then log('notice', 'Ambuscade diagnostic log: ' .. trace_path); end
+        state.combat_trace = function(time, label, details)
+            combat_trace.event(time, label, target_trace_details(details));
+        end;
         ambuscade.activate(); ambuscade.reset(); active_mode = ambuscade;
+        state.ambuscade_last_command_at = now();
+        state.ambuscade_last_heartbeat_at = 0;
+        state.ambuscade_last_watchdog_at = 0;
+        local valid, validation_message = ambuscade.validate();
+        if (not valid) then
+            combat_trace.close();
+            log('error', validation_message);
+            return;
+        end
     elseif (state.settings.mode[1] == 2) then
         active_mode = nil;
         if (#enabled_commands() == 0) then
@@ -323,6 +383,8 @@ local function action_ready(action)
         local spell = AshitaCore:GetResourceManager():GetSpellById(action.id);
         return spell ~= nil and is_spell_ready(spell);
     elseif (action.kind == 'ability' and action.recast_id ~= nil) then
+        local party = AshitaCore:GetMemoryManager():GetParty();
+        if (party ~= nil and (party:GetMemberTP(0) or 0) < (action.tp_cost or 0)) then return false; end
         local recast = AshitaCore:GetMemoryManager():GetRecast();
         for index = 0, 31 do
             if (recast:GetAbilityTimerId(index) == action.recast_id) then
@@ -344,6 +406,7 @@ local mode_context = {
     action_ready = action_ready,
     stop = stop,
     timeline_add = timeline_add,
+    trace_event = trace_event,
     timeline_prune = timeline_prune,
     ambuscade_queue = ambuscade_queue,
     selected_actions = selected_actions,
@@ -356,6 +419,25 @@ local mode_context = {
         return spell and target_for(spell) or '<t>';
     end,
     action_command = action_catalog.command,
+    schedule_action = function(action, minimum_delay, target)
+        local party = AshitaCore:GetMemoryManager():GetParty();
+        local target_id = 0;
+        if (target == '<me>') then
+            target_id = party and (party:GetMemberServerId(0) or 0) or 0;
+        elseif (target == '<t>') then
+            local target_manager = AshitaCore:GetMemoryManager():GetTarget();
+            local index = target_manager and (target_manager:GetTargetIndex(0) or 0) or 0;
+            target_id = index > 0 and (AshitaCore:GetMemoryManager():GetEntity():GetServerId(index) or 0) or 0;
+        else
+            local party_index = type(target) == 'string' and tonumber(target:match('^<p(%d)>$')) or nil;
+            if (party_index ~= nil and party_index >= 1 and party_index <= 5) then
+                target_id = party and (party:GetMemberServerId(party_index) or 0) or 0;
+            end
+        end
+        return action_timing.schedule(state, now(), action, minimum_delay, target_id);
+    end,
+    action_outcome = function(key) return action_timing.consume_outcome(state, key); end,
+    cancel_action = function(reason) return action_timing.cancel(state, now(), reason); end,
     player_engaged = is_player_engaged,
 };
 ambuscade = require('modes.ambuscade').new(mode_context);
@@ -363,7 +445,36 @@ skillup = require('modes.skillup').new(mode_context);
 afk = require('modes.afk').new(mode_context);
 
 local function tick()
-    if (not state.active or state.paused or now() < state.next_action) then return; end
+    if (not state.active or state.paused) then return; end
+    local current_time = now();
+    if (state.settings.mode[1] == 3
+        and current_time - (state.ambuscade_last_heartbeat_at or 0) >= 5.0) then
+        state.ambuscade_last_heartbeat_at = current_time;
+        trace_event('tick_heartbeat', ('active=%s paused=%s player_ready=%s phase=%s cursor=%s next_action=%.3f due=%s status=%q'):fmt(
+            tostring(state.active), tostring(state.paused), tostring(player_ready()),
+            tostring(state.ambuscade_phase), tostring(state.ambuscade_cursor),
+            tonumber(state.next_action) or -1, tostring(current_time >= (tonumber(state.next_action) or 0)),
+            tostring(state.status)));
+        local player = type(GetPlayerEntity) == 'function' and GetPlayerEntity() or nil;
+        local engaged = player ~= nil and player.Status == ENTITY_STATUS_ENGAGED;
+        if (engaged and state.pending_action == nil
+            and current_time - (state.ambuscade_last_command_at or current_time) >= 5.0
+            and current_time - (state.ambuscade_last_watchdog_at or 0) >= 5.0) then
+            state.ambuscade_last_watchdog_at = current_time;
+            trace_event('rotation_watchdog', ('idle_for=%.2f phase=%s cursor=%s next_action=%.3f due=%s player_ready=%s status=%q'):fmt(
+                current_time - state.ambuscade_last_command_at, tostring(state.ambuscade_phase),
+                tostring(state.ambuscade_cursor), tonumber(state.next_action) or -1,
+                tostring(current_time >= (tonumber(state.next_action) or 0)),
+                tostring(player_ready()), tostring(state.status)));
+        end
+    end
+    action_timing.poll(state, current_time);
+    if (state.settings.mode[1] == 3 and ambuscade.urgent_tick()) then return; end
+    if (state.pending_action ~= nil) then
+        state.next_action = math.min(state.pending_action.timeout_at, current_time + 0.1);
+        return;
+    end
+    if (current_time < state.next_action) then return; end
     if (state.settings.mode[1] ~= 4 and not player_ready()) then return; end
 
     if (state.settings.mode[1] == 3) then
@@ -400,10 +511,23 @@ ashita.events.register('command', 'smartskillup_command', function (e)
     local command = (#args > 1 and args[2]:lower()) or 'help';
     if (command == '__restoretarget') then
         local index = state.ambuscade_restore_target_index;
-        if (index > 0 and type(GetEntity) == 'function' and GetEntity(index) ~= nil) then
-            AshitaCore:GetMemoryManager():GetTarget():SetTarget(index, true);
+        local expected_server_id = state.ambuscade_restore_target_server_id or 0;
+        local entity_manager = AshitaCore:GetMemoryManager():GetEntity();
+        local current_target = AshitaCore:GetMemoryManager():GetTarget();
+        local current_index = current_target:GetTargetIndex(0) or 0;
+        local current_entity = current_index > 0 and type(GetEntity) == 'function' and GetEntity(current_index) or nil;
+        local current_name = current_entity and (current_entity.Name or current_entity.name or '') or '';
+        local actual_server_id = index > 0 and (entity_manager:GetServerId(index) or 0) or 0;
+        local allowed = current_name:lower() ~= 'bozzetto golden bomb'
+            and index > 0 and expected_server_id ~= 0 and actual_server_id == expected_server_id
+            and type(GetEntity) == 'function' and GetEntity(index) ~= nil;
+        trace_event('lullaby_restore_command', ('allowed=%s restore_index=%d expected_server_id=%s actual_server_id=%s current_name=%q'):fmt(
+            tostring(allowed), index, tostring(expected_server_id), tostring(actual_server_id), current_name));
+        if (allowed) then
+            current_target:SetTarget(index, true);
         end
         state.ambuscade_restore_target_index = 0;
+        state.ambuscade_restore_target_server_id = 0;
     elseif (command:any('start', 'go', 'on')) then
         start();
     elseif (command:any('stop', 'off')) then
@@ -431,14 +555,38 @@ ashita.events.register('command', 'smartskillup_command', function (e)
 end);
 
 ashita.events.register('text_in', 'smartskillup_ambuscade_buffs', function (e)
+    if (state.active and state.settings.mode[1] == 3) then
+        local message = (e.message_modified or ''):strip_colors():gsub('[\30\31\127]', ''):gsub('%c', ' ');
+        trace_event('text_in', ('message=%q'):fmt(message));
+    end
+    if (state.active and state.pending_action ~= nil) then
+        local message = (e.message_modified or ''):strip_colors():gsub('[\30\31\127]', ''):gsub('%c', ' '):lower();
+        local party = AshitaCore:GetMemoryManager():GetParty();
+        local player_name = party and (party:GetMemberName(0) or ''):lower() or '';
+        local player_interrupted = player_name ~= ''
+            and message:find(player_name .. "'s casting is interrupted", 1, true) ~= nil;
+        if (message:find('unable to cast', 1, true)
+            or player_interrupted
+            or message:find('cannot use', 1, true)
+            or message:find('not enough mp', 1, true)
+            or message:find('recast time', 1, true)
+            or message:find('unable to use', 1, true)) then
+            action_timing.cancel(state, now(), message);
+        end
+    end
     if (state.settings.mode[1] == 3) then ambuscade.on_text(e); end
 end);
 
 ashita.events.register('packet_in', 'smartskillup_afk_packet', function (e)
+    if (state.active and state.settings.mode[1] == 3) then combat_trace.packet(now(), 'in', e); end
+    if (state.active) then action_timing.on_packet(state, e, now()); end
     if (state.active and state.settings.mode[1] == 4) then afk.on_packet(e); end
 end);
 
 ashita.events.register('packet_out', 'smartskillup_afk_packet_out', function (e)
+    if (state.active and state.settings.mode[1] == 3) then combat_trace.packet(now(), 'out', e); end
+    if (state.active) then action_timing.on_packet_out(state, e, now()); end
+    if (state.active and state.settings.mode[1] == 3) then ambuscade.on_packet_out(e); end
     if (state.active and state.settings.mode[1] == 4) then afk.on_packet_out(e); end
 end);
 
@@ -479,11 +627,18 @@ local ui_context = {
 };
 
 ashita.events.register('d3d_present', 'smartskillup_present', function ()
-    tick();
+    local ok, failure = xpcall(tick, debug.traceback);
+    if (not ok) then
+        trace_event('tick_exception', ('error=%q'):fmt(tostring(failure)));
+        state.paused = true;
+        state.status = 'Paused after combat tick error; see diagnostic log';
+        log('error', state.status);
+    end
     config_ui.render(ui_context);
 end);
 
 ashita.events.register('unload', 'smartskillup_unload', function ()
+    combat_trace.close();
     if (state.active and active_mode and active_mode.stop) then active_mode.stop(); end
     if (afk and afk.shutdown_navigation) then afk.shutdown_navigation(); end
     if (state.resting) then queue('/heal'); end

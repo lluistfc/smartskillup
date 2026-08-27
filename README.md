@@ -64,8 +64,14 @@ SmartSkillup has four execution modes:
   mob claimed by a player or Trust in the party. It never adopts unclaimed mobs
   or mobs claimed by another party. Navmesh routing is attempted when a matching
   zone mesh is installed; direct auto-follow is the fallback.
-  Selected Bard songs are skipped while their player buff is active and are
-  refreshed according to the configurable duration and early-refresh margin.
+  Combat uses the same role-based policy and settings as Ambuscade while target
+  acquisition and movement remain AFK-specific. This includes emergency healing,
+  recurring setup buffs, TP recovery, trust-synchronized weapon skills, combat
+  buffs, and combat debuffs. The Terpander dummy-song procedure and three-song
+  rotation are therefore identical in both modes. Automatic dispel remains
+  fight-profile-specific because AFK mode does not track enemy enhancement text.
+  Combat debuffs are tracked per target and per selected action; they are not
+  reapplied until the configurable assumed effect duration expires.
   An opt-in combat packet recorder writes incoming and outgoing packet metadata
   plus complete raw hexadecimal payloads under
   `config/addons/smartskillup/logs/` for later behavior analysis. The same log
@@ -86,6 +92,9 @@ it uses a checked healing action. On Normal and above it automatically targets
 On Easy and Very Easy it targets Jody directly because the adds are absent.
 Whenever **Bozzetto Golden Bomb** appears, it immediately takes priority over
 the normal target order so the party can kill it for the 100-point bonus.
+Golden Bomb detection bypasses normal song, spell, ability, and weaponskill
+delays. The profile retargets it immediately and briefly retries `/attack <t>`
+until the player and trusts have had an opportunity to transfer targets.
 Vivian remains the final combat target so manual Sleep macros are not disrupted
 while Julika or Jody is still active.
 When a Sleep-capable action is checked, SmartSkillup briefly selects Vivian,
@@ -99,6 +108,9 @@ Below the configured weapon-skill TP threshold it can use a checked TP-recovery
 action before continuing the weapon-skill cycle.
 The routine never sends `/attack off`; target changes do not deliberately
 disengage the player or withdraw trusts.
+Target acquisition and `/attack <t>` take priority over songs, spells, and job
+abilities. When one target dies, the profile explicitly attacks the next target
+before resuming buffs or other actions so trusts transfer immediately.
 The window has checked-by-default controls for Julika, Vivian, and Jody. Uncheck
 a mob when it dies to remove it immediately from targeting and spell steps; all
 three controls reset to checked when a new routine starts.
@@ -121,8 +133,41 @@ checked setup buffs are refreshed every 135 seconds. Both values are
 configurable in the Ambuscade panel. A checked dispel action is used only while
 battle messages indicate that the current target has a removable enhancement.
 The panel displays the number of known buffs on each enemy.
+Action pacing uses each spell's resource cast time plus a small safety margin,
+with short bounded delays for abilities and weapon skills. Nightingale songs use
+an instant-cast delay. Matching player action-result packets release the wait
+early, while interruption, recast, and insufficient-MP messages also wake the
+rotation. State transitions such as engagement and movement retain their own
+short fixed stabilization delays.
+Queued actions are tracked as in-flight until they complete, fail, or reach a
+bounded packet timeout. Initial and recurring song setup advances only after a
+confirmed completion; failed or timed-out casts retain their position and retry
+with backoff. Combat-debuff duration tracking likewise begins only after the
+debuff action completes.
 
-Trust summoning, battlefield entry, movement, and repeat entry are intentionally manual.
+When **Use Terpander three-song rotation** is enabled, the shared combat script
+automatically casts **Advancing March**, **Valor Minuet V**, **Army's Paeon**,
+and an encounter-selected third song; these songs do not need to be selected as
+setup buffs. The default third song is **Blade Madrigal**. During the Jody phase,
+the rotation selects **Mage's Ballad III** when Apururu is at or below 55% MP or
+Shantotto II is at or below 35% MP. The decision is frozen for the complete song
+cycle so changing MP cannot alter an in-progress sequence. Army's Paeon is sung
+with Terpander to establish a short dummy in the additional slot, then the
+selected third real song overwrites the dummy using the normal potency instrument. The
+resulting active songs are Advancing March, Valor Minuet V, and the selected
+third song.
+The dummy is used only during initial setup. Normal refresh cycles recast the
+three real songs without casting Army's Paeon again.
+On the initial Ambuscade setup only, the profile uses **Nightingale** followed by
+**Troubadour** before starting the song sequence when those abilities are known
+and ready. Recurring song refreshes do not spend these long recasts, and AFK
+mode does not use them automatically.
+
+After selecting and engaging each priority target, Ambuscade can automatically
+approach it to the configured melee distance using Ashita's direct-follow
+movement. Movement stops before the shared combat rotation runs and whenever
+the target changes, disappears, the routine resets, or the addon stops. Trust
+summoning, battlefield entry, and repeat entry remain manual.
 
 ## Commands
 

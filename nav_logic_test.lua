@@ -40,6 +40,17 @@ equal(endpoint, 1, "endpoint distance")
 equal(nav.waypoint_reached(1.49), true, "waypoint within tolerance")
 equal(nav.waypoint_reached(1.51), false, "waypoint outside tolerance")
 
+local shortened = nav.stop_short({ { x = 10, y = 0, z = 2 } },
+    { x = 0, y = 0, z = 0 }, { x = 10, y = 0, z = 2 }, 2.5)
+equal(shortened[1].x, 7.5, "path stops before target")
+equal(shortened[1].y, 0, "shortened path y")
+
+local left = nav.lateral_detour({ x = 0, y = 0, z = 1 }, { x = 5, y = 0, z = 1 }, 3, 1)
+equal(left.x, 0, "left detour x")
+equal(left.y, 3, "left detour y")
+local right = nav.lateral_detour({ x = 0, y = 0, z = 1 }, { x = 5, y = 0, z = 1 }, 3, -1)
+equal(right.y, -3, "right detour y")
+
 points, err = nav.normalize({ { x = 0 / 0, y = 0, z = 0 } }, { x = 0, y = 0, z = 0 }, { x = 1, y = 0, z = 0 })
 equal(points, nil, "invalid waypoint result")
 equal(err, "waypoint_data_invalid", "invalid waypoint error")

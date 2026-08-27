@@ -1,4 +1,6 @@
 local M = {};
+local combat_rotation = require 'combat_rotation';
+local movement_controller = require 'movement_controller';
 
 function M.new(ctx)
 local state = ctx.state;
@@ -11,21 +13,77 @@ local is_player_engaged = ctx.is_player_engaged;
 local action_ready = ctx.action_ready;
 local stop = ctx.stop;
 local timeline_add = ctx.timeline_add;
+local trace = ctx.trace_event or function() end;
 local ambuscade_queue = ctx.ambuscade_queue;
 
 local ambuscade_targets = {
     'Bozzetto Julika',
-    'Bozzetto Jody',
     'Bozzetto Vivian',
+    'Bozzetto Jody',
 };
 
 local ambuscade_bonus_target = 'Bozzetto Golden Bomb';
+local opening_song_abilities = { 'Nightingale', 'Troubadour' };
 
-local function ambuscade_song_refresh_interval()
-    local duration = state.settings.ambuscade.song_duration[1];
-    local margin = state.settings.ambuscade.song_refresh_margin[1];
-    return math.max(30.0, duration - margin);
+local function find_job_ability(name)
+    for _, action in ipairs(state.action_catalog.job_abilities or {}) do
+        if ((action.name or ''):lower() == name:lower()) then return action; end
+    end
+    return nil;
 end
+
+local function try_opening_song_ability()
+    local current_time = now();
+    if (state.ambuscade_opening_started_at == 0) then
+        state.ambuscade_opening_started_at = current_time;
+        state.ambuscade_opening_deadline = current_time + 25;
+    elseif (current_time >= state.ambuscade_opening_deadline) then
+        trace('opening_degraded', 'reason=ability_deadline');
+        state.ambuscade_opening_ability_cursor = #opening_song_abilities + 1;
+        state.ambuscade_opening_pending_token = nil;
+        state.status = 'Opening abilities degraded: opener deadline reached';
+        return false;
+    end
+    if (state.ambuscade_opening_pending_token ~= nil) then
+        local outcome = ctx.action_outcome(state.ambuscade_opening_pending_token);
+        if (outcome == nil) then return true; end
+        state.ambuscade_opening_pending_token = nil;
+        if (outcome.status == 'completed') then
+            trace('opening_ability_result', ('name=%q token=%s status=completed'):fmt(
+                tostring(state.ambuscade_opening_pending_name), tostring(outcome.token)));
+            state.ambuscade_opening_ability_cursor = state.ambuscade_opening_ability_cursor + 1;
+        else
+            local key = state.ambuscade_opening_pending_name or 'unknown';
+            local attempts = (state.ambuscade_opening_attempts[key] or 0) + 1;
+            state.ambuscade_opening_attempts[key] = attempts;
+            if (attempts >= 2) then
+                trace('opening_ability_result', ('name=%q token=%s status=%s attempts=%d degraded=true'):fmt(
+                    key, tostring(outcome.token), tostring(outcome.status), attempts));
+                state.ambuscade_opening_ability_cursor = state.ambuscade_opening_ability_cursor + 1;
+                state.status = 'Opening ability degraded: ' .. key;
+            end
+        end
+        state.ambuscade_opening_pending_name = nil;
+    end
+    while (state.ambuscade_opening_ability_cursor <= #opening_song_abilities) do
+        local name = opening_song_abilities[state.ambuscade_opening_ability_cursor];
+        local action = find_job_ability(name);
+        if (action ~= nil and action_ready(action)) then
+            ambuscade_queue(action.name, action_catalog.command(action, '<me>'));
+            state.last_spell = action.name;
+            state.status = 'Opening song ability: ' .. action.name;
+            state.ambuscade_opening_pending_token = ctx.schedule_action(action, nil, '<me>');
+            trace('opening_ability_queued', ('name=%q token=%s'):fmt(
+                action.name, tostring(state.ambuscade_opening_pending_token)));
+            state.ambuscade_opening_pending_name = action.name;
+            return true;
+        end
+        state.ambuscade_opening_ability_cursor = state.ambuscade_opening_ability_cursor + 1;
+    end
+    return false;
+end
+local combat = combat_rotation.new(ctx);
+local movement = movement_controller.new(ctx);
 
 local function current_target()
     local target = AshitaCore:GetMemoryManager():GetTarget();
@@ -75,6 +133,9 @@ local function vivian_should_be_slept()
     if (#role_actions('sleep', 'sleep') == 0) then return false; end
     local vivian = ambuscade_mob_checked('Bozzetto Vivian')
         and find_entity_named('Bozzetto Vivian') ~= nil;
+    -- Current target cannot determine intent here because the Lullaby FSM
+    -- temporarily selects Vivian. Under the encounter kill order, Vivian is
+    -- controlled only while Julika is still the live priority target.
     local julika = ambuscade_mob_checked('Bozzetto Julika')
         and find_entity_named('Bozzetto Julika') ~= nil;
     return vivian and julika;
@@ -91,10 +152,10 @@ local function find_ambuscade_target()
     if (bonus ~= nil) then
         if (target_name(current):lower() == ambuscade_bonus_target:lower()
             and target_hp_percent(current) > 0) then
-            return current, false;
+            return current, false, target_manager:GetTargetIndex(0);
         end
         target_manager:SetTarget(bonus_index, true);
-        return bonus, true;
+        return bonus, true, bonus_index;
     end
 
     for _, expected in ipairs(ambuscade_targets) do
@@ -102,55 +163,13 @@ local function find_ambuscade_target()
         if (ambuscade_mob_checked(expected) and entity ~= nil) then
             if (target_name(current):lower() == expected:lower()
                 and target_hp_percent(current) > 0) then
-                return current, false;
+                return current, false, target_manager:GetTargetIndex(0);
             end
             target_manager:SetTarget(index, true);
-            return entity, true;
+            return entity, true, index;
         end
     end
     return nil, false;
-end
-
-local function player_hp_percent()
-    local party = AshitaCore:GetMemoryManager():GetParty();
-    return party ~= nil and (party:GetMemberHPPercent(0) or 0) or 0;
-end
-
-local function player_tp()
-    local party = AshitaCore:GetMemoryManager():GetParty();
-    return party ~= nil and (party:GetMemberTP(0) or 0) or 0;
-end
-
-local function trust_tp(expected_name)
-    local party = AshitaCore:GetMemoryManager():GetParty();
-    if (party == nil) then return nil; end
-    for index = 1, 5 do
-        if (party:GetMemberIsActive(index) == 1) then
-            local name = party:GetMemberName(index) or '';
-            if (name:lower() == expected_name:lower()) then
-                return party:GetMemberTP(index) or 0;
-            end
-        end
-    end
-    return nil;
-end
-
-local function shantotto_tp()
-    return trust_tp('Shantotto II');
-end
-
-local function qultada_tp()
-    return trust_tp('Qultada');
-end
-
-local function shantotto_ready_for_ws()
-    local tp = shantotto_tp();
-    return tp == nil or tp >= state.settings.ambuscade.shantotto_sync_tp[1];
-end
-
-local function qultada_ready_for_ws()
-    local tp = qultada_tp();
-    return tp == nil or tp < 1000;
 end
 
 local function finishing_moves()
@@ -179,22 +198,42 @@ local function has_player_buff(buff_id)
 end
 
 local function reset_ambuscade()
-    state.ambuscade_phase = 'setup';
-    state.ambuscade_cursor = 1;
+    movement.stop();
+    combat.reset();
+    state.ambuscade_opening_ability_cursor = 1;
+    state.ambuscade_opening_pending_token = nil;
+    state.ambuscade_opening_pending_name = nil;
+    state.ambuscade_opening_attempts = {};
+    state.ambuscade_opening_started_at = 0;
+    state.ambuscade_opening_deadline = 0;
+    state.ambuscade_lullaby_marcato_attempted = false;
+    state.combat_opening_troubadour_seen = false;
     state.ambuscade_setup_verified = 0;
+    state.ambuscade_initial_setup_complete = false;
     state.ambuscade_song_attempts = 0;
-    state.ambuscade_samba_at = 0;
-    state.ambuscade_step_at = 0;
     state.ambuscade_lullaby_pending = false;
+    state.ambuscade_lullaby_pending_token = nil;
+    state.ambuscade_lullaby_restore_queued = false;
     state.ambuscade_lullaby_verify_at = 0;
+    state.ambuscade_lullaby_attempts = 0;
+    state.ambuscade_lullaby_retry_at = 0;
+    state.ambuscade_lullaby_targeting = false;
     state.ambuscade_vivian_asleep = false;
     state.ambuscade_restore_target_index = 0;
-    state.ambuscade_song_at = 0;
-    state.ambuscade_finale_at = 0;
-    state.ambuscade_ws_wait_started = 0;
-    state.ambuscade_reverse_at = 0;
-    state.ambuscade_waltz_at = 0;
+    state.ambuscade_restore_target_server_id = 0;
     state.ambuscade_engaged = false;
+    state.ambuscade_target_transition_server_id = 0;
+    state.ambuscade_target_transition_until = 0;
+    state.ambuscade_target_transition_retry_at = 0;
+    state.ambuscade_target_transition_attempts = 0;
+    state.ambuscade_bonus_engage_at = 0;
+    state.ambuscade_bonus_engage_attempts = 0;
+    state.ambuscade_bonus_server_id = 0;
+    state.ambuscade_bonus_ws_pending_token = nil;
+    state.ambuscade_bonus_ws_opened = false;
+    state.ambuscade_bonus_ws_dispatched = false;
+    state.ambuscade_bonus_spawn_at = 0;
+    state.ambuscade_bonus_spawn_tp = 0;
     state.ambuscade_timeline = {};
     for _, name in ipairs(ambuscade_targets) do
         state.ambuscade_mobs[name][1] = true;
@@ -202,22 +241,203 @@ local function reset_ambuscade()
     end
 end
 
-local function try_priority_lullaby()
-    if (not vivian_should_be_slept() or state.ambuscade_vivian_asleep) then return false; end
+local function urgent_tick()
+    local bonus, bonus_index = find_entity_named(ambuscade_bonus_target);
+    if (bonus == nil or bonus_index == nil) then
+        state.ambuscade_bonus_engage_at = 0;
+        state.ambuscade_bonus_engage_attempts = 0;
+        state.ambuscade_bonus_server_id = 0;
+        state.ambuscade_bonus_ws_pending_token = nil;
+        state.ambuscade_bonus_ws_opened = false;
+        state.ambuscade_bonus_ws_dispatched = false;
+        state.ambuscade_bonus_spawn_at = 0;
+        state.ambuscade_bonus_spawn_tp = 0;
+        return false;
+    end
 
     local current_time = now();
+    local entities = AshitaCore:GetMemoryManager():GetEntity();
+    local bonus_server_id = entities:GetServerId(bonus_index) or 0;
+    if (bonus_server_id == 0) then
+        state.status = 'Priority interrupt: waiting for Golden Bomb identity';
+        state.next_action = current_time + 0.05;
+        return true;
+    end
+    if (state.ambuscade_bonus_server_id ~= bonus_server_id) then
+        state.ambuscade_bonus_server_id = bonus_server_id;
+        state.ambuscade_bonus_engage_attempts = 0;
+        state.ambuscade_bonus_ws_pending_token = nil;
+        state.ambuscade_bonus_ws_opened = false;
+        state.ambuscade_bonus_ws_dispatched = false;
+        state.ambuscade_bonus_spawn_at = current_time;
+        state.ambuscade_bonus_spawn_tp = combat.player_tp();
+        trace('golden_detected', ('server_id=%s index=%d spawn_tp=%d configured_ws=%q'):fmt(
+            tostring(bonus_server_id), bonus_index, state.ambuscade_bonus_spawn_tp,
+            tostring((role_actions('weapon_skill')[1] or {}).name)));
+    end
+    local current = current_target();
+    local needs_target = target_name(current):lower() ~= ambuscade_bonus_target:lower();
+    if (needs_target) then state.ambuscade_bonus_engage_attempts = 0; end
+
+    movement.stop();
+    AshitaCore:GetMemoryManager():GetTarget():SetTarget(bonus_index, true);
+
+    local selected = current_target();
+    local selected_index = AshitaCore:GetMemoryManager():GetTarget():GetTargetIndex(0) or 0;
+    local selected_server_id = selected_index > 0 and (entities:GetServerId(selected_index) or 0) or 0;
+    if (selected_server_id ~= bonus_server_id or target_name(selected):lower() ~= ambuscade_bonus_target:lower()) then
+        trace('golden_target_wait', ('expected_server_id=%s selected_server_id=%s selected_name=%q'):fmt(
+            tostring(bonus_server_id), tostring(selected_server_id), target_name(selected)));
+        state.status = 'Priority interrupt: acquiring Golden Bomb target';
+        state.next_action = current_time + 0.05;
+        return true;
+    end
+
+    local party = AshitaCore:GetMemoryManager():GetParty();
+    local hp_percent = party and (party:GetMemberHPPercent(0) or 100) or 100;
+    local emergency_heal = combat.ready_role_action('heal');
+    if (hp_percent <= 20 and emergency_heal ~= nil and state.pending_action == nil) then
+        ambuscade_queue('Critical heal before Golden Bomb',
+            action_catalog.command(emergency_heal, '<me>'));
+        state.last_spell = emergency_heal.name;
+        state.status = 'Critical survival action before Golden Bomb opener';
+        ctx.schedule_action(emergency_heal, nil, '<me>');
+        return true;
+    end
+
+    if (state.settings.ambuscade.approach_targets[1]) then
+        local approaching, distance = movement.approach(
+            bonus_index, state.settings.ambuscade.approach_stop_distance[1]);
+        if (approaching) then
+            state.status = ('Priority interrupt: approaching Golden Bomb (%.1f yalms)'):fmt(distance);
+            state.next_action = current_time + 0.05;
+            return true;
+        end
+    end
+
+    if (state.ambuscade_bonus_ws_pending_token ~= nil) then
+        local outcome = ctx.action_outcome(state.ambuscade_bonus_ws_pending_token);
+        if (outcome == nil) then
+            if (state.ambuscade_bonus_ws_dispatched
+                and state.ambuscade_bonus_engage_attempts == 0) then
+                ambuscade_queue('Switch trusts to ' .. ambuscade_bonus_target, '/attack <t>');
+                state.ambuscade_bonus_engage_attempts = 1;
+                state.ambuscade_bonus_engage_at = current_time + 0.5;
+                trace('golden_trust_switch', 'reason=ws_outgoing_accepted');
+            end
+            state.status = 'Priority interrupt: opening Golden Bomb with weaponskill';
+            state.next_action = current_time + 0.1;
+            return true;
+        end
+        state.ambuscade_bonus_ws_pending_token = nil;
+        trace('golden_ws_result', ('token=%s status=%s reason=%q'):fmt(
+            tostring(outcome.token), tostring(outcome.status), tostring(outcome.reason)));
+        if (outcome.status == 'completed') then
+            state.ambuscade_bonus_ws_opened = true;
+        end
+    end
+
+    local opening_ws = role_actions('weapon_skill')[1];
+    local strict_ws = state.ambuscade_bonus_spawn_tp >= 1000 and opening_ws ~= nil;
+    if (strict_ws and not state.ambuscade_bonus_ws_opened and combat.player_tp() >= 1000) then
+        if (state.pending_action ~= nil) then
+            trace('golden_strict_wait', ('reason=pending_action spawn_tp=%d live_tp=%d pending_token=%s'):fmt(
+                state.ambuscade_bonus_spawn_tp, combat.player_tp(), tostring(state.pending_action.token)));
+            state.status = 'Priority interrupt: holding first Golden Bomb offense for weaponskill';
+            state.next_action = current_time + 0.1;
+            return true;
+        elseif (not action_ready(opening_ws)) then
+            trace('golden_strict_wait', ('reason=ws_not_ready spawn_tp=%d live_tp=%d ws=%q'):fmt(
+                state.ambuscade_bonus_spawn_tp, combat.player_tp(), opening_ws.name));
+            state.status = 'Priority interrupt: waiting for strict Golden Bomb weaponskill';
+            state.next_action = current_time + 0.1;
+            return true;
+        else
+            ambuscade_queue('Golden Bomb opener: ' .. opening_ws.name,
+                action_catalog.command(opening_ws, '<t>'));
+            state.last_spell = opening_ws.name;
+            state.status = 'Priority interrupt: weaponskill on ' .. ambuscade_bonus_target;
+            state.ambuscade_bonus_ws_pending_token = ctx.schedule_action(opening_ws, nil, '<t>');
+            trace('golden_ws_queued', ('token=%s ws=%q spawn_tp=%d live_tp=%d'):fmt(
+                tostring(state.ambuscade_bonus_ws_pending_token), opening_ws.name,
+                state.ambuscade_bonus_spawn_tp, combat.player_tp()));
+            return true;
+        end
+    end
+
+    local needs_attack_retry = state.ambuscade_bonus_engage_attempts < 4
+        and current_time >= (state.ambuscade_bonus_engage_at or 0);
+    if (not needs_target and not needs_attack_retry) then
+        state.status = 'Priority interrupt: waiting for Golden Bomb resolution';
+        state.next_action = current_time + 0.1;
+        return true;
+    end
+
+    ambuscade_queue('Emergency engage ' .. ambuscade_bonus_target, '/attack <t>');
+    trace('golden_attack_fallback', ('spawn_tp=%d live_tp=%d engaged=%s ws_opened=%s attempts=%d'):fmt(
+        state.ambuscade_bonus_spawn_tp, combat.player_tp(), tostring(is_player_engaged()),
+        tostring(state.ambuscade_bonus_ws_opened), state.ambuscade_bonus_engage_attempts + 1));
+    state.ambuscade_engaged = true;
+    state.ambuscade_bonus_engage_attempts = state.ambuscade_bonus_engage_attempts + 1;
+    state.ambuscade_bonus_engage_at = current_time + 0.5;
+    state.status = 'Priority interrupt: engaging ' .. ambuscade_bonus_target;
+    state.next_action = current_time + 0.25;
+    return true;
+end
+
+local function try_priority_lullaby()
+    -- Preserve the full Troubadour/Nightingale window for the initial song
+    -- rotation. Once that opener has completed, Lullaby remains a priority
+    -- even while recurring buffs are later being refreshed.
+    if (not state.ambuscade_initial_setup_complete) then return false; end
+    if (not vivian_should_be_slept() or state.ambuscade_vivian_asleep) then
+        state.ambuscade_lullaby_targeting = false;
+        return false;
+    end
+
+    local current_time = now();
+    if (current_time < (state.ambuscade_lullaby_retry_at or 0)) then return false; end
     if (state.ambuscade_lullaby_pending) then
         if (current_time < state.ambuscade_lullaby_verify_at) then return false; end
         state.ambuscade_lullaby_pending = false;
-        timeline_add('Sleep not confirmed; will retry when ready');
+        state.ambuscade_lullaby_pending_token = nil;
+        state.ambuscade_lullaby_attempts = (state.ambuscade_lullaby_attempts or 0) + 1;
+        local retry_delays = { 1, 2, 5 };
+        local delay = retry_delays[math.min(#retry_delays, state.ambuscade_lullaby_attempts)];
+        state.ambuscade_lullaby_retry_at = current_time + delay;
+        timeline_add(('Sleep not confirmed; retrying in %ds'):fmt(delay));
+        trace('lullaby_retry', ('reason=verification_timeout attempts=%d delay=%d'):fmt(
+            state.ambuscade_lullaby_attempts, delay));
+        return false;
     end
-    local sleep_action = role_actions('sleep', 'sleep')[1];
+    local sleep_actions = role_actions('sleep', 'sleep');
+    local sleep_action;
+    for _, expected in ipairs({ 'Foe Lullaby II', 'Foe Lullaby', 'Horde Lullaby II', 'Horde Lullaby' }) do
+        for _, action in ipairs(sleep_actions) do
+            if ((action.name or ''):lower() == expected:lower()) then sleep_action = action; break; end
+        end
+        if (sleep_action ~= nil) then break; end
+    end
+    sleep_action = sleep_action or sleep_actions[1];
     if (sleep_action == nil) then return false; end
     if (sleep_action.kind == 'spell') then
         local spell = AshitaCore:GetResourceManager():GetSpellById(sleep_action.id);
         if (spell == nil or not is_spell_ready(spell)) then return false; end
     end
     if (find_entity_named(ambuscade_bonus_target) ~= nil) then return false; end
+
+    if (not state.ambuscade_lullaby_marcato_attempted) then
+        state.ambuscade_lullaby_marcato_attempted = true;
+        local marcato = find_job_ability('Marcato');
+        if (marcato ~= nil and action_ready(marcato)) then
+            ambuscade_queue('Marcato for Vivian Lullaby', action_catalog.command(marcato, '<me>'));
+            state.last_spell = marcato.name;
+            state.status = 'Preparing high-accuracy Lullaby for Vivian';
+            ctx.schedule_action(marcato, nil, '<me>');
+            trace('lullaby_marcato_queued', ('vivian_pending=false name=%q'):fmt(marcato.name));
+            return true;
+        end
+    end
 
     local vivian, vivian_index = find_entity_named('Bozzetto Vivian');
     if (vivian == nil) then return false; end
@@ -232,110 +452,156 @@ local function try_priority_lullaby()
     if (restore_index == 0) then return false; end
 
     state.ambuscade_restore_target_index = restore_index;
-    target_manager:SetTarget(vivian_index, true);
+    local entities = AshitaCore:GetMemoryManager():GetEntity();
+    state.ambuscade_restore_target_server_id = entities:GetServerId(restore_index) or 0;
+    local current_index = target_manager:GetTargetIndex(0) or 0;
+    local current_server_id = current_index > 0 and (entities:GetServerId(current_index) or 0) or 0;
+    local vivian_server_id = entities:GetServerId(vivian_index) or 0;
+    if (current_server_id ~= vivian_server_id) then
+        state.ambuscade_lullaby_targeting = true;
+        trace('lullaby_target_request', ('vivian_index=%d vivian_server_id=%s restore_index=%d restore_server_id=%s current_server_id=%s'):fmt(
+            vivian_index, tostring(vivian_server_id), restore_index,
+            tostring(state.ambuscade_restore_target_server_id), tostring(current_server_id)));
+        target_manager:SetTarget(vivian_index, true);
+        state.status = 'Acquiring Vivian for priority Lullaby';
+        state.next_action = current_time + 0.05;
+        return true;
+    end
+    state.ambuscade_lullaby_targeting = false;
     ambuscade_queue(sleep_action.name .. ' on Bozzetto Vivian', action_catalog.command(sleep_action, '<t>'));
-    -- This private command is processed immediately after the spell command,
-    -- once FFXI has locked the cast target, restoring the combat target without
-    -- disengaging or changing the party's battle target.
-    queue('/sms __restoretarget');
     state.last_spell = sleep_action.name;
     state.ambuscade_lullaby_pending = true;
     state.ambuscade_lullaby_verify_at = current_time + 5.0;
     state.status = 'Applying Sleep to Vivian; restoring combat target';
-    state.next_action = current_time + 4.0;
+    local sleep_token = ctx.schedule_action(sleep_action, nil, '<t>');
+    state.ambuscade_lullaby_pending_token = sleep_token;
+    state.ambuscade_lullaby_restore_queued = false;
+    trace('lullaby_queued', ('token=%s spell=%q vivian_index=%d vivian_server_id=%s restore_index=%d restore_server_id=%s'):fmt(
+        tostring(sleep_token), sleep_action.name, vivian_index, tostring(vivian_server_id),
+        restore_index, tostring(state.ambuscade_restore_target_server_id)));
     return true;
-end
-
-local function ready_role_action(role, effect)
-    for _, action in ipairs(role_actions(role, effect)) do
-        if (action_ready(action)) then return action; end
-    end
-    return nil;
-end
-
-local function use_ambuscade_action(action, target, status, delay)
-    ambuscade_queue(action.name, action_catalog.command(action, target));
-    state.last_spell = action.name;
-    state.status = status or action.name;
-    state.next_action = now() + (delay or (action.kind == 'spell' and 4.0 or 2.0));
 end
 
 local function tick_ambuscade()
     local current_time = now();
-    local heal = ready_role_action('heal');
-    if (heal and player_hp_percent() <= state.settings.ambuscade.heal_below[1]
-        and current_time >= state.ambuscade_waltz_at) then
-        use_ambuscade_action(heal, '<me>', 'Emergency self-heal', 3.0);
-        state.ambuscade_waltz_at = current_time + 8.0;
-        return;
-    end
-    if (try_priority_lullaby()) then return; end
-
-    local setup = role_actions('setup_buff');
-    if (state.ambuscade_phase == 'setup') then
-        local action = setup[state.ambuscade_cursor];
-        if (action) then
-            use_ambuscade_action(action, '<me>', ('Setup buff %d/%d'):fmt(state.ambuscade_cursor, #setup),
-                action.kind == 'spell' and 10.0 or 2.0);
-            state.ambuscade_cursor = state.ambuscade_cursor + 1;
-            return;
-        end
-        state.ambuscade_song_at = current_time + ambuscade_song_refresh_interval();
-        state.ambuscade_phase = 'combat';
-    end
-
-    local target, changed = find_ambuscade_target();
+    -- A target change made for Lullaby spans frames. Let that operation verify
+    -- and dispatch before the normal kill-target selector restores Julika.
+    if (state.ambuscade_lullaby_targeting and try_priority_lullaby()) then return; end
+    local target, changed, target_index = find_ambuscade_target();
     if (target == nil) then
+        movement.stop();
         if (state.ambuscade_engaged) then stop('Ambuscade routine complete: all targets defeated.'); return; end
+        if (state.ambuscade_phase == 'setup' and state.ambuscade_song_at == 0
+            and try_opening_song_ability()) then return; end
+        if (combat.tick({
+            has_target = false,
+            target_name = target_name(target),
+            target_has_enhancements = false,
+            queue_action = ambuscade_queue,
+        })) then return; end
         state.status = 'Waiting for Ambuscade targets'; state.next_action = current_time + 0.5; return;
     end
-    if (changed) then state.status = 'Switching target to ' .. target_name(target); state.next_action = current_time + 0.5; return; end
+    if (changed) then
+        movement.stop();
+        if (state.pending_action ~= nil and state.pending_action.target_server_id ~= 0) then
+            local new_server_id = AshitaCore:GetMemoryManager():GetEntity():GetServerId(target_index) or 0;
+            local player_id = AshitaCore:GetMemoryManager():GetParty():GetMemberServerId(0) or 0;
+            if (new_server_id ~= 0 and state.pending_action.target_server_id ~= new_server_id
+                and state.pending_action.target_server_id ~= player_id) then
+                ctx.cancel_action('target_changed');
+            end
+        end
+        ambuscade_queue('Engage ' .. target_name(target), '/attack <t>');
+        trace('normal_target_changed', ('desired_index=%s desired_name=%q attack_queued=true'):fmt(
+            tostring(target_index), target_name(target)));
+        state.ambuscade_engaged = true;
+        local server_id = AshitaCore:GetMemoryManager():GetEntity():GetServerId(target_index) or 0;
+        state.ambuscade_target_transition_server_id = server_id;
+        state.ambuscade_target_transition_until = current_time + 1.0;
+        state.ambuscade_target_transition_retry_at = current_time + 0.35;
+        state.ambuscade_target_transition_attempts = 1;
+        state.status = 'Engaging new target ' .. target_name(target);
+        state.next_action = current_time + 0.15;
+        return;
+    end
+    local transition_id = state.ambuscade_target_transition_server_id or 0;
+    if (transition_id ~= 0) then
+        local selected_id = AshitaCore:GetMemoryManager():GetEntity():GetServerId(target_index) or 0;
+        if (selected_id ~= transition_id) then
+            state.ambuscade_target_transition_server_id = 0;
+        elseif (current_time < state.ambuscade_target_transition_until) then
+            if (current_time >= state.ambuscade_target_transition_retry_at
+                and state.ambuscade_target_transition_attempts < 3) then
+                ambuscade_queue('Confirm engage ' .. target_name(target), '/attack <t>');
+                state.ambuscade_target_transition_attempts = state.ambuscade_target_transition_attempts + 1;
+                state.ambuscade_target_transition_retry_at = current_time + 0.35;
+                trace('normal_target_engage_retry', ('server_id=%s attempt=%d'):fmt(
+                    tostring(transition_id), state.ambuscade_target_transition_attempts));
+            end
+            state.status = 'Confirming party target ' .. target_name(target);
+            state.next_action = current_time + 0.1;
+            return;
+        else
+            trace('normal_target_transition_settled', ('server_id=%s attempts=%d'):fmt(
+                tostring(transition_id), state.ambuscade_target_transition_attempts));
+            state.ambuscade_target_transition_server_id = 0;
+        end
+    end
     if (not is_player_engaged()) then
         ambuscade_queue('Engage ' .. target_name(target), '/attack <t>');
         state.ambuscade_engaged = true; state.status = 'Engaging ' .. target_name(target);
-        state.next_action = current_time + 1.0; return;
+        state.next_action = current_time + 0.15; return;
     end
 
-    local tp, threshold = player_tp(), state.settings.ambuscade.weapon_skill_tp[1];
-    local recovery = ready_role_action('tp_recovery');
-    if (recovery and tp < threshold and current_time >= state.ambuscade_reverse_at) then
-        use_ambuscade_action(recovery, '<me>', 'Recovering TP');
-        state.ambuscade_reverse_at = current_time + 10.0; return;
+    -- Once a target exists, establish combat before spending time on any job
+    -- ability or song so trusts begin attacking immediately after transitions.
+    if (state.ambuscade_phase == 'setup' and state.ambuscade_song_at == 0
+        and try_opening_song_ability()) then return; end
+    if (state.ambuscade_phase == 'combat') then
+        state.ambuscade_initial_setup_complete = true;
     end
-    local ws = ready_role_action('weapon_skill');
-    if (ws and tp >= threshold) then
-        local trusts_ready = shantotto_ready_for_ws() and qultada_ready_for_ws();
-        if (state.ambuscade_ws_wait_started == 0) then state.ambuscade_ws_wait_started = current_time; end
-        local waited = current_time - state.ambuscade_ws_wait_started;
-        if (trusts_ready or waited >= state.settings.ambuscade.ws_sync_wait[1]) then
-            use_ambuscade_action(ws, '<t>', ('Weaponskill: %s (%d TP)'):fmt(ws.name, tp));
-            state.ambuscade_ws_wait_started = 0; return;
-        end
-        state.status = ('Holding WS for trusts (%.1f/%.1fs)'):fmt(waited, state.settings.ambuscade.ws_sync_wait[1]);
-        state.next_action = current_time + 0.25; return;
+    if (try_priority_lullaby()) then return; end
+
+    if (state.ambuscade_phase == 'setup') then
+        if (combat.tick({
+            has_target = false,
+            target_has_enhancements = false,
+            queue_action = ambuscade_queue,
+        })) then return; end
+    end
+
+    local approaching, distance = false, movement.distance(target_index);
+    local target_server_id = AshitaCore:GetMemoryManager():GetEntity():GetServerId(target_index) or 0;
+    local melee_confirmed = target_server_id ~= 0
+        and state.combat_melee_target_server_id == target_server_id
+        and current_time - (state.combat_melee_confirmed_at or 0) <= 3.5;
+    if (state.settings.ambuscade.approach_targets[1] and not melee_confirmed) then
+        approaching, distance = movement.approach(
+            target_index, state.settings.ambuscade.approach_stop_distance[1]);
     else
-        state.ambuscade_ws_wait_started = 0;
+        movement.stop();
+    end
+    if (approaching) then
+        state.status = ('Approaching %s (%.1f yalms)'):fmt(target_name(target), distance);
+        state.next_action = current_time + 0.1;
+        return;
+    elseif (melee_confirmed and distance ~= nil
+        and distance > state.settings.ambuscade.approach_stop_distance[1]) then
+        trace('approach_suppressed', ('reason=recent_melee distance=%.2f server_id=%s'):fmt(
+            distance, tostring(target_server_id)));
     end
 
-    local dispel = ready_role_action('dispel');
-    if (dispel and target_has_enhancements(target) and current_time >= state.ambuscade_finale_at) then
-        use_ambuscade_action(dispel, '<t>', 'Dispelling ' .. target_name(target), 3.0);
-        state.ambuscade_finale_at = current_time + 15.0; return;
-    end
-    local buff = ready_role_action('combat_buff');
-    if (buff and current_time >= state.ambuscade_samba_at) then
-        use_ambuscade_action(buff, '<me>', 'Refreshing combat buff');
-        state.ambuscade_samba_at = current_time + 60.0; return;
-    end
-    local debuff = ready_role_action('combat_debuff');
-    if (debuff and current_time >= state.ambuscade_step_at) then
-        use_ambuscade_action(debuff, '<t>', 'Applying combat debuff');
-        state.ambuscade_step_at = current_time + 20.0; return;
-    end
-    if (#setup > 0 and current_time >= state.ambuscade_song_at) then
-        state.ambuscade_phase = 'setup'; state.ambuscade_cursor = 1;
-        state.next_action = current_time; state.status = 'Refreshing setup buffs'; return;
-    end
+    local combat_target_server_id = AshitaCore:GetMemoryManager():GetEntity():GetServerId(target_index) or 0;
+    local combat_target_key = combat_target_server_id ~= 0
+        and tostring(combat_target_server_id) or ('index:%d'):fmt(target_index);
+    if (combat.tick({
+        has_target = true,
+        target_key = combat_target_key,
+        target_name = target_name(target),
+        target_has_enhancements = target_has_enhancements(target),
+        queue_action = ambuscade_queue,
+    })) then return; end
+
     state.status = ('Fighting %s (%d%%)'):fmt(target_name(target), target_hp_percent(target));
     state.next_action = current_time + 0.5;
 end
@@ -344,11 +610,11 @@ local function ambuscade_next_action_label()
     if (not state.active) then return 'Press Start'; end
     if (state.paused) then return 'Paused'; end
     if (state.ambuscade_phase == 'setup') then
-        local action = role_actions('setup_buff')[state.ambuscade_cursor];
+        local action = combat.setup_actions()[state.ambuscade_cursor];
         return action and action.name or 'Begin combat';
     end
     if (vivian_should_be_slept() and not state.ambuscade_vivian_asleep) then
-        local action = ready_role_action('sleep', 'sleep');
+        local action = combat.ready_role_action('sleep', 'sleep');
         if (action) then return action.name .. ' on Vivian'; end
     end
     return 'Selected actions / combat';
@@ -378,13 +644,25 @@ local function on_text(e)
         if (applied) then
             state.ambuscade_vivian_asleep = true;
             state.ambuscade_lullaby_pending = false;
+            state.ambuscade_lullaby_attempts = 0;
+            state.ambuscade_lullaby_retry_at = 0;
+            state.ambuscade_lullaby_pending_token = nil;
             timeline_add('Confirmed: Sleep on Bozzetto Vivian');
+            trace('lullaby_text_result', ('status=applied message=%q'):fmt(message));
         elseif (removed or failed) then
             state.ambuscade_vivian_asleep = false;
             state.ambuscade_lullaby_pending = false;
+            state.ambuscade_lullaby_pending_token = nil;
+            state.ambuscade_lullaby_attempts = (state.ambuscade_lullaby_attempts or 0) + 1;
+            local retry_delays = { 1, 2, 5 };
+            state.ambuscade_lullaby_retry_at = now()
+                + retry_delays[math.min(#retry_delays, state.ambuscade_lullaby_attempts)];
             timeline_add(removed and 'Sleep ended on Bozzetto Vivian'
                 or 'Selected Sleep action failed on Bozzetto Vivian');
-            state.next_action = now();
+            trace('lullaby_text_result', ('status=%s attempts=%d retry_at=%.3f message=%q'):fmt(
+                removed and 'removed' or 'failed', state.ambuscade_lullaby_attempts,
+                state.ambuscade_lullaby_retry_at, message));
+            state.next_action = state.ambuscade_lullaby_retry_at;
         end
     end
 
@@ -404,27 +682,88 @@ local function on_text(e)
             end
         end
     end
+
+
+    if (lower:find('magic finale', 1, true) and lower:find('no effect', 1, true)) then
+        for _, name in ipairs(ambuscade_targets) do
+            if (lower:find(name:lower(), 1, true)) then
+                state.ambuscade_buffs[name] = {};
+                state.ambuscade_finale_at = now() + 30.0;
+                trace('finale_text_result', ('target=%q status=no_effect buffs_cleared=true'):fmt(name));
+            end
+        end
+    end
+
+    local step_level = lower:match('sluggish daze %(lv%.(%d+)%)');
+    if (step_level ~= nil and lower:find('box step', 1, true)) then
+        for _, name in ipairs(ambuscade_targets) do
+            if (lower:find(name:lower(), 1, true)) then
+                local _, index = find_entity_named(name);
+                local server_id = index and (AshitaCore:GetMemoryManager():GetEntity():GetServerId(index) or 0) or 0;
+                if (server_id ~= 0) then
+                    local key = ('%s|ability:714'):fmt(tostring(server_id));
+                    local level = tonumber(step_level) or 0;
+                    state.combat_step_state[key] = {
+                        level = level,
+                        confirmed_level = level,
+                        expires = now() + 60,
+                        confidence = 'battle_text',
+                    };
+                    state.combat_debuff_until[key] = now() + (level >= 5 and 45 or 6);
+                    trace('step_text_confirmed', ('target=%q key=%q level=%d'):fmt(name, key, level));
+                end
+            end
+        end
+    end
+end
+
+local function on_packet_out()
+    local golden_token = state.ambuscade_bonus_ws_pending_token;
+    if (golden_token ~= nil and state.pending_action ~= nil
+        and state.pending_action.token == golden_token and state.pending_action.sent_at ~= nil
+        and not state.ambuscade_bonus_ws_dispatched) then
+        state.ambuscade_bonus_ws_dispatched = true;
+        trace('golden_ws_dispatched', ('token=%s target_server_id=%s'):fmt(
+            tostring(golden_token), tostring(state.pending_action.outgoing_target_server_id)));
+    end
+    local token = state.ambuscade_lullaby_pending_token;
+    local pending = state.pending_action;
+    if (token == nil or state.ambuscade_lullaby_restore_queued
+        or pending == nil or pending.token ~= token or pending.sent_at == nil) then return; end
+    state.ambuscade_lullaby_restore_queued = true;
+    trace('lullaby_outgoing_accepted', ('token=%s outgoing_target_server_id=%s restore_queued=true'):fmt(
+        tostring(token), tostring(pending.outgoing_target_server_id)));
+    queue('/sms __restoretarget');
 end
 
 return {
     targets = ambuscade_targets,
     reset = reset_ambuscade,
+    stop = movement.stop,
+    pause = movement.stop,
+    urgent_tick = urgent_tick,
     tick = tick_ambuscade,
     next_action = ambuscade_next_action_label,
     on_text = on_text,
+    on_packet_out = on_packet_out,
     timeline_prune = ctx.timeline_prune,
     timeline_add = timeline_add,
-    player_tp = player_tp,
-    shantotto_tp = shantotto_tp,
-    qultada_tp = qultada_tp,
+    player_tp = combat.player_tp,
+    shantotto_tp = combat.shantotto_tp,
+    qultada_tp = combat.qultada_tp,
     finishing_moves = finishing_moves,
+    validate = function()
+        if (not state.settings.ambuscade.terpander_three_song[1]) then return true, nil; end
+        local ok, missing = combat.terpander_rotation_ready();
+        return ok, ok and nil or ('Terpander rotation is missing: ' .. tostring(missing));
+    end,
     role_count = function(role) return #role_actions(role); end,
     buff_count = ambuscade_buff_count,
     ui_stats = function()
         return {
-            ('Player TP: %d  Shantotto II: %s  Qultada: %s'):fmt(player_tp(),
-                shantotto_tp() or 'N/A', qultada_tp() or 'N/A'),
-            ('Finishing Moves: %d  Setup buffs: %d'):fmt(finishing_moves(), #role_actions('setup_buff')),
+            ('Player TP: %d  Shantotto II: %s  Qultada: %s'):fmt(combat.player_tp(),
+                combat.shantotto_tp() or 'N/A', combat.qultada_tp() or 'N/A'),
+            ('Finishing Moves: %d  Setup buffs: %d'):fmt(finishing_moves(), #combat.setup_actions()),
             'Vivian Sleep: ' .. (state.ambuscade_lullaby_pending and 'verifying'
                 or (state.ambuscade_vivian_asleep and 'active' or 'missing')),
             ('Known enemy buffs — Julika: %d  Vivian: %d  Jody: %d'):fmt(
@@ -436,5 +775,3 @@ return {
 end
 
 return M;
-
-

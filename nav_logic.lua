@@ -40,6 +40,37 @@ function M.waypoint_reached(distance, tolerance)
     return type(distance) == "number" and distance <= (tolerance or 1.5)
 end
 
+function M.stop_short(path, start_position, target_position, stop_distance)
+    if not path or #path == 0 or not start_position or not target_position then return path end
+    local distance = math.max(0, tonumber(stop_distance) or 0)
+    if distance == 0 then return path end
+    local previous = #path > 1 and path[#path - 1] or start_position
+    local dx, dy = previous.x - target_position.x, previous.y - target_position.y
+    local length = math.sqrt((dx * dx) + (dy * dy))
+    if length <= 0.001 then return path end
+    local result = {}
+    for index = 1, #path - 1 do result[index] = path[index] end
+    result[#path] = {
+        x = target_position.x + (dx / length) * distance,
+        y = target_position.y + (dy / length) * distance,
+        z = path[#path].z,
+    }
+    return result
+end
+
+function M.lateral_detour(start_position, destination, distance, side)
+    if not start_position or not destination then return nil end
+    local dx, dy = destination.x - start_position.x, destination.y - start_position.y
+    local length = math.sqrt((dx * dx) + (dy * dy))
+    if length <= 0.001 then return nil end
+    local offset = math.max(0.5, tonumber(distance) or 3.0) * ((side or 1) < 0 and -1 or 1)
+    return {
+        x = start_position.x - (dy / length) * offset,
+        y = start_position.y + (dx / length) * offset,
+        z = start_position.z,
+    }
+end
+
 function M.normalize(points, start_position, target_position, maximum_points)
     local result = {}
     local limit = math.min(#points, maximum_points or 256)

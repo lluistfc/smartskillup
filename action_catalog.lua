@@ -1,6 +1,7 @@
 local M = {}
 local ACTION_CATEGORIES = { 'spells', 'job_abilities', 'weapon_skills' }
 local TRUST_SPELL_MIN_ID, TRUST_SPELL_MAX_ID = 896, 1019
+local JOB_ABILITY_MIN_ID, JOB_ABILITY_MAX_ID = 0x200, 0x3FF
 local COMMAND_PREFIXES = {
     spell = '/ma',
     ability = '/ja',
@@ -81,6 +82,7 @@ function M.build(player, resources)
                 add(result, seen, {
                     key = 'spell:' .. id,
                     id = id,
+                    packet_id = spell.Index or id,
                     category = 'spells',
                     kind = 'spell',
                     name = name,
@@ -98,7 +100,11 @@ function M.build(player, resources)
     end
 
     if enabled(player:HasAbilityData()) then
-        for id = 0, 1023 do
+        -- Resource ids below 0x200 contain weapon skills and menu-category
+        -- headers such as "Sambas", "Jigs", and "Steps". HasAbility can
+        -- report those indices as available, so only scan the job-ability
+        -- resource range here; weapon skills are collected separately below.
+        for id = JOB_ABILITY_MIN_ID, JOB_ABILITY_MAX_ID do
             local ok, known = pcall(player.HasAbility, player, id)
             if ok and enabled(known) then
                 local ability = resources:GetAbilityById(id)
@@ -106,11 +112,15 @@ function M.build(player, resources)
                     add(result, seen, {
                         key = 'ability:' .. id,
                         id = id,
+                        -- Outgoing/incoming action packets use the job ability
+                        -- list index (resource id minus the 0x200 JA offset).
+                        packet_id = id - JOB_ABILITY_MIN_ID,
                         category = 'job_abilities',
                         kind = 'ability',
                         name = text(ability.Name),
                         description = text(ability.Description):lower(),
                         targets = ability.Targets or 0,
+                        tp_cost = ability.TPCost or 0,
                         recast_id = ability.RecastTimerId,
                     })
                 end
@@ -123,6 +133,7 @@ function M.build(player, resources)
                     add(result, seen, {
                         key = 'weaponskill:' .. id,
                         id = id,
+                        packet_id = ability.Index or id,
                         category = 'weapon_skills',
                         kind = 'weaponskill',
                         name = text(ability.Name),
