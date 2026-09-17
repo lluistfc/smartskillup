@@ -26,10 +26,11 @@ effect.
 - `modes/skillup.lua` repeatedly executes checked actions for skill progression.
 - `modes/afk.lua` detects and engages hostile actors that attack the player.
 - `modes/ambuscade.lua` loads the selected fight from `ambuscades/registry.lua`.
+- `modes/tangaroa.lua` handles Tangaroa's Venom Shell, Doom, and weapon swap mechanics.
 - `ambuscades/plantoids_2026_08.lua` contains the current fight-specific tactics.
 - `config_ui.lua` renders the configuration window and mode panels.
 
-SmartSkillup has four execution modes:
+SmartSkillup has five execution modes:
 
 - **Skill-up Rotation** repeatedly rotates checked available actions.
 - **Command Rotation** executes an ordered list of user-provided commands and
@@ -77,6 +78,15 @@ SmartSkillup has four execution modes:
   `config/addons/smartskillup/logs/` for later behavior analysis. The same log
   records target adoption, measured distance, attack and follow commands,
   Ashita auto-run state, movement progress, retries, and stop reasons.
+- **Tangaroa** uses the shared role-based combat rotation against Tangaroa while
+  it is exposed. `Venom Shell` switches the configured main weapon to a club and
+  spends TP on the configured blunt weapon skill (True Strike by default). The
+  mode issues `/lac disable main` before its first weapon swap and restores the
+  slot with `/lac enable main` when stopped. Doom
+  buff detection repeatedly uses Holy Water. A stagger message restores the
+  exposed weapon and normal rotation; manual phase buttons are available if
+  the localized battle text is not recognized. The mode never selects another
+  target and requires the player to engage Tangaroa manually.
 
 Additional Ambuscade fights should be implemented as separate files under
 `ambuscades/` and registered in `ambuscades/registry.lua`; the core mode does not

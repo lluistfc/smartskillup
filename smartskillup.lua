@@ -16,7 +16,7 @@ local ENTITY_STATUS_ENGAGED = 1;
 
 local defaults = T{
     visible = T{ true },
-    mode = T{ 1 }, -- 1 = skill-up, 2 = commands, 3 = Ambuscade, 4 = AFK
+    mode = T{ 1 }, -- 1 = skill-up, 2 = commands, 3 = Ambuscade, 4 = AFK, 5 = Tangaroa
     delay = T{ 4.0 },
     mp_limit = T{ 0 },
     rest_below = T{ 15 },
@@ -39,6 +39,12 @@ local defaults = T{
         mob_name = T{ '' },
         spell_key = T{ '' },
         range = T{ 20 },
+    },
+    tangaroa = T{
+        dagger = T{ 'Kaja Knife' },
+        club = T{ '' },
+        shell_weapon_skill = T{ 'True Strike' },
+        holy_water_interval = T{ 1.2 },
     },
     ambuscade = T{
         profile = T{ 'plantoids_2026_08' },
@@ -104,6 +110,10 @@ local state = {
     ambuscade_last_command_at = 0,
     ambuscade_last_heartbeat_at = 0,
     ambuscade_last_watchdog_at = 0,
+    tangaroa_phase = 'exposed',
+    tangaroa_equipped_phase = nil,
+    tangaroa_holy_water_at = 0,
+    tangaroa_lac_main_disabled = false,
 };
 if (state.settings.ambuscade.weapon_skill_tp[1] ~= 1000
     and state.settings.ambuscade.weapon_skill_tp[1] ~= 2000
@@ -310,6 +320,7 @@ end
 local ambuscade;
 local skillup;
 local afk;
+local tangaroa;
 local function set_paused(value)
     state.paused = value;
     if (value and active_mode and active_mode.pause) then active_mode.pause(); end
@@ -358,6 +369,10 @@ local function start()
         active_mode = afk;
         local ok, message = afk.start();
         if (not ok) then log('error', message); return; end
+    elseif (state.settings.mode[1] == 5) then
+        active_mode = tangaroa;
+        local ok, message = tangaroa.start();
+        if (not ok) then log('error', message); return; end
     else
         active_mode = skillup;
         local ok, message = skillup.start();
@@ -369,10 +384,12 @@ local function start()
     state.next_action = now();
     state.status = state.settings.mode[1] == 3 and 'Ambuscade: preparing buffs'
         or (state.settings.mode[1] == 4 and state.status
-        or (state.settings.mode[1] == 2 and 'Running commands' or 'Running actions'));
+        or (state.settings.mode[1] == 5 and 'Tangaroa: ready'
+        or (state.settings.mode[1] == 2 and 'Running commands' or 'Running actions')));
     log('ok', state.settings.mode[1] == 3 and (ambuscade.label .. ' routine started.')
         or (state.settings.mode[1] == 4 and 'AFK retaliation armed.'
-        or (state.settings.mode[1] == 2 and 'Command session started.' or 'Skill-up session started.')));
+        or (state.settings.mode[1] == 5 and 'Tangaroa routine started.'
+        or (state.settings.mode[1] == 2 and 'Command session started.' or 'Skill-up session started.'))));
 end
 
 local function action_ready(action)
@@ -443,6 +460,7 @@ local mode_context = {
 ambuscade = require('modes.ambuscade').new(mode_context);
 skillup = require('modes.skillup').new(mode_context);
 afk = require('modes.afk').new(mode_context);
+tangaroa = require('modes.tangaroa').new(mode_context);
 
 local function tick()
     if (not state.active or state.paused) then return; end
@@ -482,6 +500,9 @@ local function tick()
         return;
     elseif (state.settings.mode[1] == 4) then
         afk.tick();
+        return;
+    elseif (state.settings.mode[1] == 5) then
+        tangaroa.tick();
         return;
     elseif (state.settings.mode[1] == 2) then
         local commands = enabled_commands();
@@ -575,6 +596,7 @@ ashita.events.register('text_in', 'smartskillup_ambuscade_buffs', function (e)
         end
     end
     if (state.settings.mode[1] == 3) then ambuscade.on_text(e); end
+    if (state.active and state.settings.mode[1] == 5) then tangaroa.on_text(e); end
 end);
 
 ashita.events.register('packet_in', 'smartskillup_afk_packet', function (e)
@@ -624,6 +646,7 @@ local ui_context = {
     wake = function () state.next_action = now(); end,
     next_action = ambuscade.next_action,
     ambuscade_stats = ambuscade.ui_stats,
+    tangaroa_set_phase = tangaroa.set_phase,
 };
 
 ashita.events.register('d3d_present', 'smartskillup_present', function ()

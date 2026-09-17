@@ -48,7 +48,7 @@ local function checklist(ctx, container, suffix, effect, only_category, open_by_
 end
 
 local function mode_selector(ctx, state)
-    local labels = { 'Skill-up Rotation', 'Command Rotation', 'Ambuscade', 'AFK Retaliation' };
+    local labels = { 'Skill-up Rotation', 'Command Rotation', 'Ambuscade', 'AFK Retaliation', 'Tangaroa' };
     if (imgui.BeginCombo('Mode', labels[state.settings.mode[1]]) ) then
         for mode, label in ipairs(labels) do
             if (imgui.Selectable(label, state.settings.mode[1] == mode)) then
@@ -57,6 +57,32 @@ local function mode_selector(ctx, state)
             end
         end
         imgui.EndCombo();
+    end
+end
+
+local function tangaroa_panel(ctx, state)
+    imgui.TextWrapped('Targets Tangaroa only. Uses the normal role-based rotation while exposed, then switches to a club and True Strike after Venom Shell. Holy Water is used repeatedly while Doom is active.')
+    imgui.TextColored({ .4, .8, 1, 1 }, 'Detected phase: ' .. (state.tangaroa_phase or 'exposed'))
+    if imgui.Button('Mark exposed', { 110, 0 }) then ctx.tangaroa_set_phase('exposed') end
+    imgui.SameLine()
+    if imgui.Button('Mark shell', { 110, 0 }) then ctx.tangaroa_set_phase('shell') end
+    imgui.PushItemWidth(210)
+    if imgui.InputText('Exposed main weapon', state.settings.tangaroa.dagger, 64) then ctx.save() end
+    if imgui.InputText('Shell main weapon', state.settings.tangaroa.club, 64) then ctx.save() end
+    if imgui.InputText('Shell weapon skill', state.settings.tangaroa.shell_weapon_skill, 64) then ctx.save() end
+    if imgui.SliderFloat('Holy Water interval', state.settings.tangaroa.holy_water_interval, 1.0, 3.0, '%.1f sec') then ctx.save() end
+    imgui.PopItemWidth()
+    imgui.TextDisabled('Set the exact name of an equippable club. Leave it blank to manage the shell weapon manually.')
+    imgui.Separator()
+    imgui.Text('Shared combat roles (used while exposed)')
+    for _, role in ipairs(roles) do
+        if role.key ~= 'sleep' and role.key ~= 'dispel' then
+            if imgui.TreeNode(role.label .. '##tangaroa_role_' .. role.key) then
+                checklist(ctx, state.settings.ambuscade.roles[role.key], 'tangaroa_role_' .. role.key,
+                    role.effect, role.category)
+                imgui.TreePop()
+            end
+        end
     end
 end
 
@@ -271,10 +297,12 @@ function M.render(ctx)
         if (state.settings.mode[1] == 1) then rotation_panel(ctx, state);
         elseif (state.settings.mode[1] == 2) then command_panel(ctx, state);
         elseif (state.settings.mode[1] == 3) then ambuscade_panel(ctx, state);
-        else
+        elseif (state.settings.mode[1] == 4) then
             imgui.BeginChild('##afk_settings', { 0, 460 }, ImGuiChildFlags_Borders);
             afk_panel(ctx, state);
             imgui.EndChild();
+        else
+            tangaroa_panel(ctx, state)
         end
         imgui.Separator();
         if (not state.active) then
